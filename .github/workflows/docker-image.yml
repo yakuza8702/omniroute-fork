@@ -1,0 +1,302 @@
+# omniroute-fork — prebuilt-release docker image pipeline
+#
+# manual dispatch only — never triggered by push/tag/schedule.
+# amd64-only by design — single-architecture builds only.
+# No compilation: the image is assembled from the pinned `omniroute` npm package.
+
+name: docker-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "OmniRoute version to package, e.g. 3.8.52 — a leading v is stripped automatically"
+        required: true
+        type: string
+        default: "3.8.52"
+      promote_latest:
+        description: "Also tag and push :latest in addition to the version tag"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-image-${{ github.ref }}/dispatch
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build-and-push-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      IMAGE_GHCR: ghcr.io/yakuza8702/omniroute-fork
+      IMAGE_DOCKERHUB: docker.io/yakuza8702/omniroute
+      # Secret-backed values are mirrored into env so step-level `if:` can test them:
+      # the `secrets` context is not available inside `if:` conditions.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Normalize version
+        shell: bash
+        env:
+          RAW_VERSION: ${{ inputs.version }}
+          PROMOTE_LATEST: ${{ inputs.promote_latest }}
+        run: |
+          set -euo pipefail
+          VERSION="${RAW_VERSION#v}"   # strip a single leading v, e.g. v3.8.52 -> 3.8.52
+          if [ -z "${VERSION}" ]; then
+            echo "::error::version input is empty after normalization"
+            exit 1
+          fi
+          # Strict allow-list guard: the version is interpolated into the build-push-action
+          # `tags:` input (comma-separated CSV), so reject anything that could inject an
+          # extra tag (commas, spaces, newlines) or smuggle a shell/registry fragment.
+          if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9A-Za-z][0-9A-Za-z._-]*$'; then
+            echo "::error::invalid version \"${VERSION}\" — must match ^[0-9A-Za-z][0-9A-Za-z._-]*$"
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "PROMOTE_LATEST=${PROMOTE_LATEST}" >> "${GITHUB_ENV}"
+          echo "Resolved version: ${VERSION} (promote_latest=${PROMOTE_LATEST})"
+
+      - name: Preflight — verify the pinned npm package exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The npm registry is public: a plain unauthenticated `npm view` is enough.
+          # Deliberately no NODE_AUTH_TOKEN / GITHUB_TOKEN here — npmjs does not need it.
+          if ! npm view "omniroute@${VERSION}" version >/dev/null 2>&1; then
+            echo "::error::prebuilt npm package omniroute@${VERSION} not published / no such version"
+            exit 1
+          fi
+          echo "OK: omniroute@${VERSION} is published on the npm registry."
+
+          # Resolve the published `bin` entry so the image ENTRYPOINT can never point at a
+          # non-existent global bin. --json gives {"<key>": "<path>"} or a bare string.
+          if ! BIN_JSON="$(npm view "omniroute@${VERSION}" bin --json 2>/dev/null)"; then
+            echo "::error::could not read the \"bin\" field of omniroute@${VERSION}"
+            exit 1
+          fi
+          if [ -z "${BIN_JSON}" ] || [ "${BIN_JSON}" = "undefined" ] || [ "${BIN_JSON}" = "null" ]; then
+            echo "::error::omniroute@${VERSION} publishes no \"bin\" field — image entrypoint cannot be resolved"
+            exit 1
+          fi
+          BIN_INFO="$(printf '%s' "${BIN_JSON}" | node -e '
+            let raw = "";
+            process.stdin.on("data", (c) => { raw += c; });
+            process.stdin.on("end", () => {
+              let v;
+              try { v = JSON.parse(raw); } catch (e) { process.exit(3); }
+              if (!v) { process.exit(3); }
+              if (typeof v === "string") { process.stdout.write("__single__"); return; }
+              const keys = Object.keys(v);
+              if (keys.length === 0) { process.exit(3); }
+              if (keys.includes("omniroute")) { process.stdout.write("omniroute"); return; }
+              process.stdout.write("KEYS:" + keys.join(","));
+            });' 2>/dev/null || true)"
+          if [ -z "${BIN_INFO}" ]; then
+            echo "::error::could not parse the \"bin\" field of omniroute@${VERSION} (raw: ${BIN_JSON})"
+            exit 1
+          fi
+          case "${BIN_INFO}" in
+            omniroute|__single__)
+              # Single-string `bin` is linked under the package name (unscoped -> omniroute).
+              BIN_NAME="omniroute"
+              ;;
+            KEYS:*)
+              BIN_KEYS="${BIN_INFO#KEYS:}"
+              case "${BIN_KEYS}" in
+                *,*)
+                  echo "::error::omniroute@${VERSION} exposes multiple bin keys (${BIN_KEYS}) and none is \"omniroute\"; the correct bin name must be chosen explicitly"
+                  exit 1
+                  ;;
+              esac
+              BIN_NAME="${BIN_KEYS}"
+              echo "::notice::omniroute@${VERSION} exposes bin key \"${BIN_NAME}\" instead of \"omniroute\" — using /usr/local/bin/${BIN_NAME}"
+              ;;
+            *)
+              echo "::error::unexpected bin resolution for omniroute@${VERSION}: ${BIN_INFO}"
+              exit 1
+              ;;
+          esac
+          echo "OMNIROUTE_BIN=/usr/local/bin/${BIN_NAME}" >> "${GITHUB_ENV}"
+          echo "Resolved global bin: /usr/local/bin/${BIN_NAME}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          GH_TAGS="${IMAGE_GHCR}:${VERSION}"
+          DH_TAGS="${IMAGE_DOCKERHUB}:${VERSION}"
+          if [ "${PROMOTE_LATEST}" = "true" ]; then
+            GH_TAGS="${GH_TAGS},${IMAGE_GHCR}:latest"
+            DH_TAGS="${DH_TAGS},${IMAGE_DOCKERHUB}:latest"
+          fi
+          echo "GH_TAGS=${GH_TAGS}" >> "${GITHUB_ENV}"
+          echo "DH_TAGS=${DH_TAGS}" >> "${GITHUB_ENV}"
+          echo "GHCR tags: ${GH_TAGS}"
+
+      - name: Build image (linux/amd64, no push yet)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          # Push is deliberately deferred until the smoke test below has passed.
+          push: false
+          load: true
+          tags: ${{ env.GH_TAGS }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            OMNIROUTE_BIN=${{ env.OMNIROUTE_BIN }}
+          cache-from: type=gha,scope=docker-amd64
+          cache-to: type=gha,mode=max,scope=docker-amd64
+          labels: |
+            org.opencontainers.image.source=https://github.com/yakuza8702/omniroute-fork
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.title=omniroute-fork
+
+      # ---- Gate: smoke test runs BEFORE anything is pushed to a registry ----
+      - name: Smoke test container (pre-push gate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${IMAGE_GHCR}:${VERSION}"
+          CID="$(docker run --detach --name omniroute-smoke -p 127.0.0.1:0:20128 "${IMAGE}")"
+          cleanup() {
+            docker logs --tail 120 "${CID}" || true
+            docker rm --force "${CID}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          HOST_PORT="$(docker port "${CID}" 20128/tcp | head -n1 | awk -F: '{print $NF}')"
+          if [ -z "${HOST_PORT}" ]; then
+            echo "::error::could not resolve mapped host port for 20128/tcp"
+            exit 1
+          fi
+          echo "Smoke testing http://127.0.0.1:${HOST_PORT} (container ${CID})"
+
+          ok=0
+          for i in $(seq 1 30); do
+            if timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/${HOST_PORT}" 2>/dev/null; then
+              echo "Port 20128 reachable after ~$((i * 2))s"
+              ok=1
+              break
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' "${CID}" 2>/dev/null || echo false)" != "true" ]; then
+              echo "::error::container exited before the service port came up"
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "${ok}" -ne 1 ]; then
+            echo "::error::service port 20128 not reachable within ~60s"
+            exit 1
+          fi
+          echo "Smoke test passed — publishing is now allowed."
+
+      # ---- Publish gate: only smoke-passed, already-loaded tags are pushed ----
+      - name: Push verified tags to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `:latest` is present in GH_TAGS only when promote_latest == true, so it can only
+          # become public after this gate — never from an unpromoted dispatch.
+          IFS=',' read -r -a TAGS <<< "${GH_TAGS}"
+          pushed=0
+          for tag in "${TAGS[@]}"; do
+            if [ -z "${tag}" ]; then
+              continue
+            fi
+            docker push "${tag}"
+            pushed=$((pushed + 1))
+          done
+          if [ "${pushed}" -eq 0 ]; then
+            echo "::error::no tags resolved to push"
+            exit 1
+          fi
+          echo "Pushed ${pushed} tag(s) to GHCR."
+
+      # ---- Optional Docker Hub mirror (never hard-fails when the secrets are absent) ----
+      - name: Log in to Docker Hub (optional)
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to Docker Hub (optional)
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The image was already built above and loaded into the local daemon (`load: true`),
+          # so this is a re-tag + push — no second build, no compilation.
+          IFS=',' read -r -a TAGS <<< "${DH_TAGS}"
+          for tag in "${TAGS[@]}"; do
+            docker tag "${IMAGE_GHCR}:${VERSION}" "${tag}"
+            docker push "${tag}"
+          done
+          echo "DOCKERHUB_PUSHED=1" >> "${GITHUB_ENV}"
+
+      - name: Docker Hub skipped
+        if: ${{ env.DOCKERHUB_USERNAME == '' || env.DOCKERHUB_TOKEN == '' }}
+        shell: bash
+        run: |
+          echo "::notice::Docker Hub push skipped — DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets are not set."
+
+      - name: Summary — pushed tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### omniroute-fork image published"
+            echo ""
+            echo "- version: \`${VERSION}\` (npm package \`omniroute@${VERSION}\`)"
+            echo "- platform: \`linux/amd64\` (single-architecture build)"
+            echo "- promote_latest: \`${PROMOTE_LATEST}\`"
+            echo "- entrypoint bin: \`${OMNIROUTE_BIN}\`"
+            echo ""
+            echo "#### GHCR tags (smoke-tested, pushed)"
+            echo ""
+            IFS=',' read -r -a TAGS <<< "${GH_TAGS}"
+            for tag in "${TAGS[@]}"; do
+              if [ -n "${tag}" ]; then
+                echo "- \`${tag}\`"
+              fi
+            done
+            if [ "${DOCKERHUB_PUSHED:-0}" = "1" ]; then
+              echo ""
+              echo "#### Docker Hub tags (optional mirror, pushed)"
+              echo ""
+              IFS=',' read -r -a DH_TAG_ARR <<< "${DH_TAGS}"
+              for tag in "${DH_TAG_ARR[@]}"; do
+                if [ -n "${tag}" ]; then
+                  echo "- \`${tag}\`"
+                fi
+              done
+            else
+              echo ""
+              echo "_Docker Hub mirror skipped — secrets not set._"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
