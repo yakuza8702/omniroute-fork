@@ -130,7 +130,8 @@ ENV OMNIROUTE_USE_TURBOPACK="${OMNIROUTE_USE_TURBOPACK}"
 ENV OMNIROUTE_MITM_STUB=1
 
 # Dockerfile:198-199 — V8 heap ceiling for the production optimization pass.
-ARG OMNIROUTE_BUILD_MEMORY_MB=6144
+# image-runner used 6144; build-next-isolated default is 8192 — CI ran with 25% less heap than proven local runs (run 39499618998)
+ARG OMNIROUTE_BUILD_MEMORY_MB=8192
 ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 
 # Dockerfile:230-231 — cap Next's page-data workers (Next derives them from CIRCLE_NODE_TOTAL).

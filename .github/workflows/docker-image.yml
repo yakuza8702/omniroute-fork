@@ -266,6 +266,7 @@ jobs:
             org.opencontainers.image.version=${{ env.VERSION }}
             org.opencontainers.image.title=omniroute-fork
             org.opencontainers.image.revision=${{ env.SOURCE_REF }}
+          progress: plain
 
       # ---- Gate: smoke test runs BEFORE anything is pushed to a registry ----
       - name: Smoke test container (pre-push gate)
