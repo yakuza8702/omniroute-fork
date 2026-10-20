@@ -15,13 +15,30 @@ Citation convention: `path:lines` is relative to the overlay target (the upstrea
 
 | Fork source | Destination | Rebase notes |
 |---|---|---|
-| `src/lib/workbuddy/types.ts:1-333` | `src/lib/workbuddy/types.ts` | **Rewritten, not copied.** One edition (`WORKBUDDY_EDITIONS` = the global entry, `providerId: "workbuddy"`, `configPath: "/v3/config"`, `catalogUserAgent: "WorkBuddy/5.5.2"`, `supportsCheckin: false`). The CN constants (`WORKBUDDY_CN_*`, `WORKBUDDY_MODELS_PATH`, check-in paths), `WorkBuddyCredential`/credits/check-in types and the region resolvers were dropped because nothing in this port uses them (single edition, no desktop import, no check-in) — they are listed under DEFERRED. Added the D9 gate `workBuddyAddonEnabled()` (server-only) and `isWorkBuddyProviderId()` (client-safe), per plan §A1. `WORKBUDDY_GLOBAL_PROVIDER_ID` is gone: `resolveWorkBuddyEdition` accepts `workbuddy`/`wb` only. |
-| `src/lib/workbuddy/upstream.ts:281-390` (parser cluster) | `src/lib/workbuddy/upstream.ts` | Trimmed to the **pure parsers**: `parseWorkBuddyCreditMultiplier`, `isSingularWorkBuddyEffortForm`, `parseWorkBuddyReasoning`, `parseWorkBuddyModel` (strict, unchanged semantics), plus the **new** `parseWorkBuddyModelLoose` (§A3/R8: keeps an entry whose token limits are absent, returns `contextLength`/`maxOutputTokens` = 0 and lets the caller omit the window). The I/O half of the fork file (envelope reads, fetch, credits, check-in, token refresh) is still not ported. **Wave 2 appended the reasoning half to this same copied file**: `WORKBUDDY_THINKING_LADDER` / `WorkBuddyEffortLevel` / `WorkBuddyReasoningContract`, `canonicalEffortWord`, `declaredEffortLadder`, `requestedThinking`, `clampToLadder` and `normalizeWorkBuddyReasoning` — a line-for-line port of `fork upstream.ts:890-1058` including the `ultra`/`maximum`→`max`, `minimum`→`minimal` and `off`/`disabled`/`false`→`none` canonicalizations, because an effort override is validated against the wider vocabulary (`shared/reasoning/reasoningEffortsOverride.ts` adds `ultra`). Still pure: no I/O, no env, no DB. |
+| `src/lib/workbuddy/types.ts:1-333` | `src/lib/workbuddy/types.ts` | **Rewritten, not copied.** One edition (`WORKBUDDY_EDITIONS` = the global entry, `providerId: "workbuddy"`, `configPath: "/v3/config"`, `catalogUserAgent: "WorkBuddy/5.5.2"`, `supportsCheckin: false`). The CN constants (`WORKBUDDY_CN_*`, `WORKBUDDY_MODELS_PATH`, check-in paths), `WorkBuddyCredential`/credits/check-in types and the region resolvers were dropped because nothing in this port uses them (single edition, no desktop import, no check-in) — they are listed under DEFERRED. Added the D9 gate `workBuddyAddonEnabled()` (server-only) and `isWorkBuddyProviderId()` (client-safe), per plan §A1. `WORKBUDDY_GLOBAL_PROVIDER_ID` is gone: `resolveWorkBuddyEdition` accepts `workbuddy`/`wb` only. **Wave 3 (§C3) added the read-side contract this module had trimmed away**: `WorkBuddyCredential`, `WorkBuddyCreditPackage`, `WorkBuddyCredits`, `WORKBUDDY_CONNECTION_KEYS`, and the gateway resolvers (`resolveWorkBuddyGlobalBase` / `workBuddyChatBase` / `workBuddyBillingBase`). Those resolvers have NO domestic branch: an unknown/empty domain falls back to `www.workbuddy.ai`, which is correct only because the addon serves one edition (D1). The check-in types stay out (DEFERRED). |
+| `src/lib/workbuddy/upstream.ts:281-390` (parser cluster) | `src/lib/workbuddy/upstream.ts` | Trimmed to the **pure parsers**: `parseWorkBuddyCreditMultiplier`, `isSingularWorkBuddyEffortForm`, `parseWorkBuddyReasoning`, `parseWorkBuddyModel` (strict, unchanged semantics), plus the **new** `parseWorkBuddyModelLoose` (§A3/R8: keeps an entry whose token limits are absent, returns `contextLength`/`maxOutputTokens` = 0 and lets the caller omit the window). The I/O half of the fork file (envelope reads, fetch, credits, check-in, token refresh) is still not ported. **Wave 2 appended the reasoning half to this same copied file**: `WORKBUDDY_THINKING_LADDER` / `WorkBuddyEffortLevel` / `WorkBuddyReasoningContract`, `canonicalEffortWord`, `declaredEffortLadder`, `requestedThinking`, `clampToLadder` and `normalizeWorkBuddyReasoning` — a line-for-line port of `fork upstream.ts:890-1058` including the `ultra`/`maximum`→`max`, `minimum`→`minimal` and `off`/`disabled`/`false`→`none` canonicalizations, because an effort override is validated against the wider vocabulary (`shared/reasoning/reasoningEffortsOverride.ts` adds `ultra`). **Wave 3 (§C3) appended the READ half** — `WorkBuddyUpstreamError`/`WorkBuddyEmptyCatalogError`, `readWorkBuddyEnvelope`, `buildWorkBuddyBillingHeaders`, `selectWorkBuddyCatalogModels`, `foldWorkBuddyCreditPackages`, `fetchWorkBuddyModels` and `fetchWorkBuddyCredits` (fork `upstream.ts:48-140,405-684`). This half IS I/O (network) and throws only bounded, sanitized errors; the parsers above stay pure. Not ported: chat-body shaping, token refresh, check-in and failure classification (DEFERRED). |
 | `src/lib/workbuddy/addonInfo.ts:1-259` | `src/lib/workbuddy/addonInfo.ts` | **Minimal** description of the shipped surface only (catalogue, credits, chat, this description). Dropped: the CN/`workbuddy-global` provider rows, the desktop credential-source scan, the check-in capability and the two-edition guarantees — advertising a capability the addon refuses to perform is worse than saying nothing. `WORKBUDDY_ADDON_PROVIDER_IDS` now has just `{ global }`. |
 | — | `tests/unit/workbuddy-normalizer.test.ts` | New (plan §9 T2). |
 | — | `tests/unit/workbuddy-managed-import.test.ts` | New (plan §9 T3). |
 | — | `tests/unit/workbuddy-synced-credit.test.ts` | New (plan §9 T4). |
-| `src/lib/workbuddy/modelDiscovery.ts:27-40,142-146` (identity + invalidation only) | `src/lib/workbuddy/modelDiscovery.ts` | **Resolved in wave 2, minimal by design.** Wave 1 did not add the fork's discovery adapter (the mapping half is DEFERRED to wave 3 — upstream's generic discovery entry already fetches and persists, plan §D2). What B5 needs from that module is the pair the sync route calls after a write, so this file carries exactly `providerToWorkBuddyProviderId()` (single edition: `workbuddy`/`wb` → `workbuddy`, everything else `null`; no `workbuddy-global` branch) and `invalidateWorkBuddyModelCaches()` (lazy `import()` of the executor's cache reset, fork `modelDiscovery.ts:142-146`, fail-open). `workBuddyModelsToSyncedInput` / `fetchWorkBuddySyncModels` / `workBuddyModelPriceTier` are **not** here — wave 3 (§C3). |
+| `src/lib/workbuddy/modelDiscovery.ts:27-40,142-146` (identity + invalidation only) | `src/lib/workbuddy/modelDiscovery.ts` | **Resolved in wave 2, minimal by design.** Wave 1 did not add the fork's discovery adapter (the mapping half is DEFERRED to wave 3 — upstream's generic discovery entry already fetches and persists, plan §D2). What B5 needs from that module is the pair the sync route calls after a write, so this file carries exactly `providerToWorkBuddyProviderId()` (single edition: `workbuddy`/`wb` → `workbuddy`, everything else `null`; no `workbuddy-global` branch) and `invalidateWorkBuddyModelCaches()` (lazy `import()` of the executor's cache reset, fork `modelDiscovery.ts:142-146`, fail-open). **Wave 3 completed the mapping half**: `workBuddyModelPriceTier`, `workBuddyModelsToSyncedInput` (catalogue → synced rows, rate + derived `isFree` carried in full) and `fetchWorkBuddySyncModels` (fork `:27-146`). No route calls the fetcher — upstream's generic discovery entry still owns the fetch and persist (§D2); the mapping is the contract that path must agree with. |
+| `src/lib/workbuddy/accounts.ts:47-69,258-324` (connection half only) | `src/lib/workbuddy/accounts.ts` | Trimmed to `credentialFromWorkBuddyConnection`, `isWorkBuddyConnectionActive`, `listWorkBuddyConnections` (platform preference order preserved), `resolveWorkBuddyConnection` / `...ById` and `describeWorkBuddyConnection`. Dropped: the desktop-file scan, the import payload builder, the probe/health writer and the pool-park clear (all DEFERRED, plan §12). |
+| `src/lib/workbuddy/freeModel.ts:1-89` | `src/lib/workbuddy/freeModel.ts` | Verbatim: `selectWorkBuddyFreeModel` (largest window wins; `undefined` is NOT free), `listWorkBuddyFreeModels`, `rankWorkBuddyModelsByCost`, `describeWorkBuddyFreeModel`. |
+| `src/lib/workbuddy/poolQuota.ts:1-732` (trimmed) | `src/lib/workbuddy/poolQuota.ts` | Single edition. Keeps the 10-minute snapshot TTL (`WORKBUDDY_QUOTA_SNAPSHOT_TTL_MS`), per-connection in-flight dedupe (`batchFor`), `Promise.allSettled` per-account isolation, `diagnoseWorkBuddyFailure`, `invalidateWorkBuddyQuotaSnapshot` and `selectWorkBuddyQuotaAccount`. ADDED a `deps` seam (`WorkBuddyPoolProbeDeps`: `listConnections`/`readCredits`) so T6 can drive the engine without a database — production never passes it. Dropped: the multi-edition loop, the shape-walking pool-state reader (replaced by one typed sibling call) and the check-in invalidation call. |
+| `src/lib/workbuddy/poolState.ts:1-453` (reader + gated writer) | `src/lib/workbuddy/poolState.ts` | The document shape is fork-compatible (`version` + `cid → {connectionId, reason, retryDueMs, updatedAt}`), the read uses `O_NOFOLLOW` and is fail-open, the write is atomic (0600 + rename). Trimmed: the failure-kind vocabulary and the merge rule belonged to the executor path this port does not ship. **The writer is off by default**: `workBuddyPoolStateWriterEnabled()` is true only for `WORKBUDDY_POOL_STATE=1` (plan §C3/§R4), so the image never creates files on the data volume unless asked. |
+| `src/shared/utils/workBuddyCredit.ts:27-78` | `src/shared/utils/workBuddyCredit.ts` | Verbatim and client-safe (no DB, no env): `isWorkBuddyProviderId`, `declaredWorkBuddyCreditMultiplier`, `workBuddyPriceTier`, `formatWorkBuddyCreditBadge`. |
+| — (new) | `src/shared/utils/workBuddyEfforts.ts` | The override vocabulary = INTERSECTION of the gateway ladder (adds `minimal`) and the override parser (adds `ultra`): `none, low, medium, high, xhigh, max` (plan §6/R7), plus parse/serialize/toggle/format helpers. |
+| `src/app/api/workbuddy/_lib.ts:1-216` | `src/app/api/workbuddy/_lib.ts` | Single edition, `requireManagementAuth` guard, sanitized error bodies, edition/account resolution, credit shaping. Dropped: the `loopbackOnly` claim (these routes are management-authenticated, not loopback-only) and the accounts/import/checkin route table. |
+| `src/app/api/workbuddy/models/route.ts`, `free-model/route.ts` | same paths | Verbatim shape, single-edition copy ("Unknown provider. Use workbuddy."). |
+| `src/app/api/workbuddy/credits/route.ts:1-302` | `src/app/api/workbuddy/credits/route.ts` | Same query surface (`?all`, `?detail=fast`, `?refresh`, `?connectionId`), served through the pool engine so the single-account read shares the snapshot. |
+| `src/app/api/workbuddy/info/route.ts:1-55` | `src/app/api/workbuddy/info/route.ts` | `describeWorkBuddyAddon()` + a network-free connection count; the deferred routes are absent from the route table. |
+| `.../components/WorkBuddyCreditBadge.tsx:1-64` | `.../components/WorkBuddyCreditBadge.tsx` | Verbatim. Renders nothing unless the provider is this addon's AND a rate is declared. |
+| — (new) | `.../components/WorkBuddyPoolCreditBadge.tsx` | Plan §C4 badge: first paint is `?all=true&detail=fast` (snapshot only, zero upstream calls), the refresh action repeats with `?refresh=1`, `unknown` is never rendered as `0`. |
+| — (new) | `.../components/WorkBuddyReasoningEffortEditor.tsx` | Plan §6 effort editor: draft seeded on OPEN (no setState-in-effect), six-level vocabulary, Save → PATCH, Clear → DELETE. |
+| — (new) | `.../hooks/useModelContextOverrides.ts` | The `CompatibleModelsSection` read/save pair lifted into a hook for the passthrough section (plan §6). |
+| — | `tests/unit/workbuddy-credit.test.ts` | New (plan §9 T1): tier, caption, declared-rate reader and the id gate. |
+| — | `tests/unit/workbuddy-pool-quota.test.ts` | New (plan §9 T6): TTL reuse, `detail=fast` never fetches, `refresh` bypass, `allSettled` isolation of a dead token, exclusions, single-connection scoping, account selection. |
+| — | `tests/unit/workbuddy-catalog-projection.test.ts` | New (plan §9 T7): `toDiscoveryCatalogModel` carries `creditMultiplier`/`isFree`, omits both when there is no claim, and leaves the pre-existing projection byte-identical. |
 | — | `tests/unit/workbuddy-reasoning.test.ts` | New (plan §9 T5). Twelve cases: the pure ladder rule (strip / clamp up / off→`none` / off→floor / unknown word / `thinking` never forwarded), the override-first contract (B2, incl. the bulk-map path and connection-scoped row precedence), the single-edition id mapping, and B3/B4 wiring (both map keys resolve to `WorkBuddyExecutor`; the wire body is clamped end-to-end; the D9 gate leaves the body untouched). |
 
 Tests live under `addon/files/tests/unit/` on purpose: `overlay.sh` copies them into the
@@ -53,6 +70,24 @@ compiled or run.
 | `tests/snapshots/executors/executor-map.json` (frozen golden) | `keyCount` 140 → 142, plus the two entries `{"className":"WorkBuddyExecutor","provider":"workbuddy","configSource":"workbuddy"}`; `sharedInstances` unchanged (each key keeps its own instance). Regenerated with `UPDATE_GOLDEN=1` against the overlaid tree, **not** hand-edited. | plan §B4; §9 matrix row for `executor-map-golden.test.ts` |
 | `src/lib/workbuddy/upstream.ts` (copied file, not a patch) | The reasoning half is appended to the wave-1 copy — see the "New files" row above. | fork `upstream.ts:890-1058` |
 | `addon/overlay.sh` (governance) | Twelve post-condition markers added for 0002 (executor class, ladder export, override read, cache reset, both map keys, sync-route call, golden snapshot, T5 file), so a patch that applies but stops short fails the build. | plan §2 ("assert every post-condition marker") |
+
+## Modified files (`addon/patches/0003-workbuddy-credits-ui.patch` — wave 3, Feature C)
+
+| Upstream anchor | Change | Fork origin |
+|---|---|---|
+| `.../components/ModelRow.tsx:263-264`, `:377` | `ModelRowProps.model` gains `creditMultiplier?: number`; the row renders `<WorkBuddyCreditBadge provider={provider} creditMultiplier={model.creditMultiplier} />` immediately after `ModelSourceBadge`. The badge gates itself on the provider id and on a declared rate, so every other provider renders byte-identically. | plan §C2; fork `ModelRow.tsx` (badge insertion only — the fork's layout rewrite is **not** ported) |
+| `.../components/PassthroughModelRow.tsx:23-60`, `:246-256` | New `creditMultiplier?: number | null` prop, rendered after `ModelSourceBadge` inside the tag row. | plan §C2 |
+| `.../components/PassthroughModelsSection.tsx:236-244`, `:272`, `:317-324`, `:452-512` | The row type carries `creditMultiplier`, both row builders attach `declaredWorkBuddyCreditMultiplier(row)`, and the JSX threads it into the row. **No new filter code**: `isModelFreeBadge`'s strict path already consumes the discovery row's `isFree` (now rate-derived by 0001), so `freeFilter`/`sortFreeFirst` become correct without a second predicate. | plan §C2/D4 |
+| `.../components/CompatibleModelsSection.tsx:252`, `:281`, `:324`, `:564-623` | Same mapping (`declaredWorkBuddyCreditMultiplier`) and the row already receives `provider={providerStorageAlias}`; `supportsVision` threading is untouched. | plan §C2 |
+| `.../components/ConnectionRow.tsx:837-847` | `<WorkBuddyPoolCreditBadge connectionId={connection.id} />` inserted **outside** the `quotaPanelSupported` gate (workbuddy is absent from `USAGE_SUPPORTED_PROVIDERS` and is not an `openai-compatible-*` id, so the Provider Limits panel never renders a card for it). | plan §C4 |
+
+## Modified files (`addon/patches/0004-workbuddy-capability-ui.patch` — wave 3, Feature D)
+
+| Upstream anchor | Change | Fork origin |
+|---|---|---|
+| `.../components/PassthroughModelsSection.tsx` (state after `:148`; JSX `:452-512`) | Threads `contextWindowOverride` + `onSaveContextWindowOverride` + `savingContextOverride` (via the new `useModelContextOverrides` hook), `supportsVision` + `onSaveSupportsVision`, and the WorkBuddy-only effort props (`reasoningEfforts`, `onSaveReasoningEfforts`, `onClearReasoningEfforts`, `savingReasoningEfforts`). Loads ctx/vision from `GET /api/provider-models?provider=` and efforts from `GET /api/model-capability-overrides` (client-side filter by `${providerId}/` prefix). | plan §6; no fork equivalent (the fork predates the upstream override APIs) |
+| `.../components/PassthroughModelRow.tsx` | New optional props: `onSaveSupportsVision`/`savingVision` render a small eye toggle next to the vision badge, and `onSaveReasoningEfforts`/`onClearReasoningEfforts`/`reasoningEfforts`/`savingReasoningEfforts` mount `WorkBuddyReasoningEffortEditor`. Absent handlers leave the row unchanged, so compat callers behave exactly as before. | plan §6 |
+| `addon/overlay.sh` (governance) | Eight post-condition markers added for 0003/0004 (credit helper, discovery mapping, pool probe, credits route, the ConnectionRow badge, the effort vocabulary, the section's effort wiring, the row's vision toggle) — 24 → 32 assertions. | plan §2 |
 
 ### Deliberate deviations from the plan text (reported, not silent)
 
@@ -122,6 +157,63 @@ compiled or run.
     identical to the prebuilt image and no line was added. No deviation from the plan — the plan's
     §7.2 sketch ("mount migrations from <standalone>/migrations") is what actually happens.
 
+**Wave 3:**
+
+12. **The discovery mapping lives in the COPIED module, not in a patch hunk.** The task text says to
+    "extend the wave-2 minimal module upstream-side via patch". `src/lib/workbuddy/modelDiscovery.ts`
+    is not an upstream file: wave 2 created it by copying `addon/files/`, and wave 2's own deviation
+    #10 established that extension-by-append happens in the copy (`upstream.ts`'s reasoning half).
+    Patching a file the overlay re-copies on every run would also make that one hunk silently
+    re-applicable on a re-run, unlike every other patch — so the mapping half was appended to the
+    copy and is covered by a post-condition marker plus the type gate instead. Everything else in
+    `0003`/`0004` is a patch against a genuine upstream file.
+13. **The overlay preflight is now CUMULATIVE (index-based), not per-patch `--check`.** From wave 3
+    on, a later patch builds on an earlier one (0004 edits the same two components 0003 touched), so
+    checking every patch against the unpatched work tree false-fails a correct series — observed on
+    the first oracle run (`0004 … patch does not apply`). The preflight replays the series against a
+    throwaway `GIT_INDEX_FILE` seeded from `HEAD`, using `git apply --cached`: the work tree is still
+    never touched before every patch has been accepted, and the first rejection still aborts with
+    "nothing was applied". Because the replay models the work tree as `HEAD`, a checkout with tracked
+    modifications is refused UP FRONT (`git diff --quiet HEAD --`), which is also what makes a
+    re-run fail closed with a clear message instead of dying inside the apply phase.
+14. **`WorkBuddyReasoningEffortEditor` seeds its draft on OPEN, not from an effect.** The obvious
+    `useEffect(() => setDraft(selected))` is rejected by the repo's `react-hooks/set-state-in-effect`
+    rule (and by React's own guidance). The editor therefore seeds the draft in the click that opens
+    it; the saved value stays the source of truth between edits, and every save closes the panel.
+15. **The vision affordance is a two-state toggle, not a tri-state menu.** The PUT accepts
+    `true | false | null`, but a visible toggle that sometimes silently clears is worse than one that
+    always states a value. Clearing remains available through the compat override reset surface that
+    already exists for custom rows; the toggle never writes `null` itself. Documented rather than
+    hidden, because the plan's wording ("small eye toggle") left the clear gesture open.
+16. **`useModelContextOverrides` duplicates one stable pattern instead of rewriting
+    `CompatibleModelsSection`.** That component already had the fetch/save pair inline; the plan
+    offers "lift into providerPageHelpers **or** a `useModelContextOverrides` hook". The hook is
+    added and used by the passthrough section; the compat component keeps its inline copy for this
+    wave (rewriting a working, unrelated component is not part of the deliverable, and the two copies
+    differ only in where the toast is raised). A follow-up can collapse them.
+17. **Pool reads are made testable through a `deps` seam.** `probeWorkBuddyPoolCredits` accepts
+    `deps.listConnections`/`deps.readCredits`, defaulting to the real modules. The harness isolates
+    `DATA_DIR` but has no connection rows, so T6 could not otherwise exercise TTL reuse, `detail=fast`
+    or `allSettled` isolation without writing fixtures into the DB. Production passes nothing.
+18. **`poolState.ts` is shipped as a reader with a DISABLED writer.** The fork's writer is called by
+    its executor/failure path, which this port deliberately does not ship (§D5), so shipping the
+    writer enabled would create a file on the data volume that no code path can justify. The writer
+    no-ops unless `WORKBUDDY_POOL_STATE=1` (§R4), and the document shape stays fork-compatible so a
+    volume written by the fork still reads here.
+19. **No new i18n keys were added.** The plan says new keys must land in all 67
+    `src/i18n/messages/*.json` files. The credits badge and the two editors therefore use literal
+    diagnostic strings (like the fork's own badge) and reuse the existing keys that do exist
+    (`contextWindowOverrideLabel`/`Hint`/`Invalid`, `freeBadge`, `visionCapableLabel`,
+    `savedModelEndpointSettings`) via `providerText(t, key, fallback)`. Nothing new to translate, and
+    the parity gates cannot regress.
+20. **The credits pool route serves the single-account read too.** The plan's `?all` table and the
+    single-account body share one engine, so a single-account poll reuses the same 10-minute snapshot
+    instead of hitting the billing endpoint per request; the single-account body keeps its old field
+    names. This is the fork's own design, kept because it makes the C4 badge cheap.
+21. **`http 401` token rejection is reported, not rewritten.** `editionError` derives `connected`
+    from the diagnosis (`auth_rejected` ⇒ false); a dead token therefore answers `connected: false`
+    with `diagnosis: "auth_rejected"` instead of the fork's earlier "connected but failed" body.
+
 ## DEFERRED (plan §12 — explicitly out of this port)
 
 * **CN edition + `workbuddy-global` provider id.** Needs a *new* id, not a rename: `workbuddy`
@@ -134,11 +226,11 @@ compiled or run.
   lines). `0002` ships only the thin `WorkBuddyExecutor` (reasoning ladder on top of
   `DefaultExecutor`); the fork's `execute()` override, its `workBuddyFailure` signal, the
   cooldown/fallback-state modules and the `accountFallback.ts` parking stay out (plan §D5).
-* **The fork's discovery adapter mapping** (`workBuddyModelsToSyncedInput`,
-  `fetchWorkBuddySyncModels`, `workBuddyModelPriceTier`, the `credits` tier mapping). `0002` adds
-  only the identity + invalidation half of `lib/workbuddy/modelDiscovery.ts`; the mapping half
-  belongs to wave 3 (§C3) because upstream's generic discovery entry already persists the roster
-  (§D2).
+* **The fork's discovery ADAPTER as a route input.** The mapping itself now ships
+  (`workBuddyModelPriceTier`, `workBuddyModelsToSyncedInput`, `fetchWorkBuddySyncModels`), but no
+  route calls the fetcher: upstream's generic discovery entry already fetches and persists the
+  roster (§D2), and the sync route only invalidates the ladder cache. Wiring a second fetch path in
+  would duplicate the request without changing what the catalogue stores.
 * **`prepareWorkBuddyChatBody`'s non-reasoning rules.** Upstream's registry entry already
   carries `forceStream`, `strictChatHistory` and `bodyStringReplacements`
   (`open-sse/config/providers/registry/workbuddy/index.ts`), so re-applying them would
@@ -146,10 +238,13 @@ compiled or run.
 * **Fork's `GET /models` workbuddy branch and the v4 `C2` stream force.** Obsolete in 3.8.53:
   the generic discovery entry already fetches and persists, and
   `opencodeFreeTierContract.ts` already sets `stream: true`.
-* **Not ported files (still listed for completeness):** fork `poolQuota.ts`, `poolState.ts`,
-  `freeModel.ts`, `addonInfo.ts`'s credits/check-in surface, the mapping half of
-  `modelDiscovery.ts` (only its identity + cache-invalidation pair is ported, above) and the four
-  workbuddy routes; they belong to waves 3-4 (§C3/§C4).
+* **`addonInfo.ts`'s check-in surface, `credentials.ts`, and the three mutating routes.** Wave 3
+  shipped the read-only surface (`models`, `credits`, `free-model`, `info`); account import,
+  check-in and the desktop credential scan remain out (§12).
+* **`WORKBUDDY_POOL_STATE` writes.** The pool-state READER ships (so a fork-written document still
+  explains an excluded account), and the writer exists behind `WORKBUDDY_POOL_STATE=1`, but nothing
+  in this port calls it: the failure path that produced those records is the fork executor that
+  §D5 keeps out.
 
 ## Provenance / rebase procedure
 
@@ -191,3 +286,21 @@ in CI once the source image is built (plan §9 gates).
 The 63-test run borrowed the fork checkout's `node_modules` via a symlink and pointed `TMPDIR` at
 the workspace disk, exactly as wave 1 did (`/workspace/.tmp_wave2`). No commit was made in this
 repository for wave 2.
+
+## Verification performed for wave 3 (not a promise — the transcript is in the hand-off)
+
+| Check | Command | Result |
+|---|---|---|
+| Full series applies | `bash addon/overlay.sh /workspace/pkgtest_scratch9` on a fresh pristine `3.8.53` copy (`rsync` + `git init`) | `overlay: preflight passed for 4 patch(es)`, `overlay: applied 0001…0004`, **32 post-condition assertions passed**, `overlay ok — 4 patch(es), 26 file(s)`, exit 0 |
+| Fail-closed | same command a second time | `overlay: preflight passed for 4 patch(es)` then exit **1** with `patch does not apply` for 0001's hunks; nothing was applied to the work tree |
+| Unit tests (T1–T7 + pre-existing + golden) | `node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts --test tests/unit/workbuddy-*.test.ts tests/unit/executor-map-golden.test.ts tests/unit/executor-registry.test.ts` | **96/96 pass**, exit 0 — T1 10, T6 10, T7 4, T2 7, T3 3, T4 6, T5 12, pre-existing workbuddy 28, gateway-compliance 9, golden 2, registry 5 |
+| open-sse typecheck gate (CI-real) | `node scripts/check/check-open-sse-typecheck.mjs` | `openSseTypecheckErrors=0`, `OK — 0 pre-existing error(s), all within frozen baseline`, exit 0 |
+| Core typecheck gate | `npm run typecheck:core` | exit 0 |
+| Dashboard typecheck gate | `npm run check:dashboard-typecheck` | `OK — 196 pre-existing error(s), all within frozen baseline`, exit 0 (the touched dashboard files reduced the frozen baseline: `CompatibleModelsSection.tsx TS2741 2 → 0`) |
+| Scoped project typecheck | `tsc --pretty false -p tsconfig.wb-wave3.json` (all wave-3 modules, routes, components, hook, T1/T6/T7 + the 5 patched components) | 38 diagnostics, **all of them pre-existing classes** also counted by the dashboard gate; filtered to the touched paths the count is **0** |
+| Route smoke (module load + envelopes) | four handlers invoked in-process with a plain `Request` inside the overlaid tree (`info`, `models`, `credits`, `free-model`, plus the pool/404 query paths) | `info` 200 (`ok:true`, contract version 1.0.0), the other three 200 with `connected:false` bodies (`No WorkBuddy account is connected…`); `?all=true&detail=fast` 200 with an empty pool and `cached:true`; `?all=true&detail=fast&connectionId=does-not-exist` **404** `connection_not_found`; `?all=true` 200 `detail:"full"` |
+| Format / lint | `prettier --check` (repo config) over every touched file, `eslint` over every ADDED module/component/route/test | clean. The only prettier warning is the pre-existing dirty `addon/files/src/lib/workbuddy/addonInfo.ts` (wave-1 file, intentionally untouched). ESLint reports 6 errors, all **pre-existing** in upstream files (verified by linting the pristine copies: `PassthroughModelRowProps`/`CompatByProtocolMap`/`testProgress`/`e` unused, `cliproxyapiEnabled`/`onToggleCliProxyapiMode` unused) |
+
+The 96-test run borrowed the fork checkout's `node_modules` via a symlink and pointed `TMPDIR` at
+`/workspace/.tmp_wave3` (the host `/tmp` is a 2 GB tmpfs and was full), exactly as waves 1–2 did.
+No commit was made in this repository for wave 3.

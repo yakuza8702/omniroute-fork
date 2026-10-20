@@ -23,13 +23,32 @@
  * operator override; see `open-sse/executors/workbuddyReasoning.ts`) and hands it in, so the
  * strip-vs-clamp rule stays testable without a database.
  *
- * Pure functions only: no I/O, no env, no DB — importable from a route, an executor or a
- * unit test.
+ * Wave 3 appends the **read half** of the upstream client — the model directory read and the
+ * credit meter — exactly the two calls this addon's routes expose (plan §C3). The parsers
+ * above stay pure; the functions at the end of this file perform network I/O and throw
+ * {@link WorkBuddyUpstreamError} carrying only a status, the upstream business code and a
+ * bounded, sanitized message, so a route can pass `error.message` straight through
+ * `sanitizeErrorMessage()` without leaking an upstream HTML page or a request id.
+ *
+ * Deliberately NOT ported (plan §12): chat-body shaping, token refresh, the daily check-in
+ * and failure classification — the registry entry and the platform own those.
  *
  * @module lib/workbuddy/upstream
  */
 
-import type { WorkBuddyModel, WorkBuddyModelReasoning } from "./types";
+import {
+  WORKBUDDY_CONFIG_PATH,
+  WORKBUDDY_CREDIT_PRODUCT_CODE,
+  WORKBUDDY_CREDITS_PATH,
+  WORKBUDDY_DESKTOP_USER_AGENT,
+  WORKBUDDY_JSON_TIMEOUT_MS,
+  workBuddyBillingBase,
+  type WorkBuddyCreditPackage,
+  type WorkBuddyCredits,
+  type WorkBuddyCredential,
+  type WorkBuddyModel,
+  type WorkBuddyModelReasoning,
+} from "./types";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -353,4 +372,336 @@ export function normalizeWorkBuddyReasoning(
   }
 
   return { ...rest, reasoning_effort: clampToLadder(requested.level, ladder) };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Upstream reads (plan §C3) — port of `fork src/lib/workbuddy/upstream.ts:48-140,405-684`.
+//
+// Single edition: every credential this module sees is the global one, so the fork's
+// domestic branch, its legacy `/v2/enterprises/personal/models` fallback and the per-region
+// user-agent switch are gone. What survives is the read itself, the envelope contract and
+// the credit fold.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Upstream answered something the addon cannot use. */
+export class WorkBuddyUpstreamError extends Error {
+  readonly status: number;
+  readonly upstreamCode: number | null;
+
+  constructor(message: string, status: number, upstreamCode: number | null = null) {
+    super(message);
+    this.name = "WorkBuddyUpstreamError";
+    this.status = status;
+    this.upstreamCode = upstreamCode;
+  }
+}
+
+/**
+ * The catalogue read SUCCEEDED but declared no usable model.
+ *
+ * A distinct type because the two answers call for different handling: an unreachable or
+ * refusing upstream means "the catalogue being served is stale", while an empty roster means
+ * "the upstream is healthy and simply lists nothing" — writing it would erase a working
+ * picker, so callers keep the previous rows and say so honestly.
+ */
+export class WorkBuddyEmptyCatalogError extends WorkBuddyUpstreamError {
+  constructor(status: number, upstreamCode: number | null = null) {
+    super("WorkBuddy model directory resolved to an empty list", status, upstreamCode);
+    this.name = "WorkBuddyEmptyCatalogError";
+  }
+}
+
+/** Envelope every WorkBuddy endpoint answers with. */
+export interface WorkBuddyEnvelope {
+  code: number;
+  msg: string;
+  data: unknown;
+}
+
+function asRecord(value: unknown): JsonRecord {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
+}
+
+/**
+ * Read the `{ code, msg, data }` envelope. A body that is not JSON (an openresty HTML 401,
+ * an empty 204) becomes a synthetic non-zero envelope rather than an exception, so every
+ * caller classifies failures on one path.
+ */
+export async function readWorkBuddyEnvelope(response: Response): Promise<WorkBuddyEnvelope> {
+  const text = await response.text().catch(() => "");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { code: response.ok ? 0 : response.status, msg: "", data: undefined };
+  }
+  const record = asRecord(parsed);
+  return {
+    code: typeof record.code === "number" ? record.code : response.ok ? 0 : response.status,
+    msg: typeof record.msg === "string" ? record.msg : "",
+    data: record.data,
+  };
+}
+
+/** Turn a non-zero envelope into a bounded, sanitized error. */
+function envelopeError(response: Response, envelope: WorkBuddyEnvelope, what: string): never {
+  const detail = envelope.msg.slice(0, 160);
+  const suffix = detail ? `: ${detail}` : "";
+  throw new WorkBuddyUpstreamError(
+    `${what} failed (http ${response.status}${envelope.code ? `, code ${envelope.code}` : ""})${suffix}`,
+    response.status,
+    envelope.code || null
+  );
+}
+
+/** Billing headers: bearer token, plus the account/tenant identity when known. */
+export function buildWorkBuddyBillingHeaders(
+  credential: WorkBuddyCredential
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${credential.accessToken}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+  if (credential.uid) headers["X-User-Id"] = credential.uid;
+  if (credential.enterpriseId) {
+    headers["X-Enterprise-Id"] = credential.enterpriseId;
+    headers["X-Tenant-Id"] = credential.enterpriseId;
+  }
+  if (credential.domain) headers["X-Domain"] = credential.domain;
+  return headers;
+}
+
+/**
+ * Select the chat-capable models from a catalogue-shaped document.
+ *
+ * `/v3/config` carries `models` plus an `agents` roster with the same entry shape. The `cli`
+ * roster's order is preserved when present; without a usable roster the whole parsed
+ * catalogue is exposed instead of nothing, because the roster is an upstream detail that may
+ * change and an empty answer would silently disarm the provider.
+ */
+export function selectWorkBuddyCatalogModels(
+  rawModels: unknown,
+  agents: unknown
+): WorkBuddyModel[] {
+  const byId = new Map<string, WorkBuddyModel>();
+  const list = Array.isArray(rawModels) ? rawModels : [];
+  for (const entry of list) {
+    const parsed = parseWorkBuddyModel(entry);
+    if (parsed) byId.set(parsed.id, parsed);
+  }
+
+  let cliIds: string[] | undefined;
+  for (const agent of Array.isArray(agents) ? agents : []) {
+    const record = asRecord(agent);
+    if (record.name === "cli" && Array.isArray(record.models)) {
+      cliIds = record.models.filter((id): id is string => typeof id === "string");
+      break;
+    }
+  }
+
+  const order = cliIds && cliIds.length > 0 ? cliIds : [...byId.keys()];
+  return order
+    .map((id) => byId.get(id))
+    .filter((model): model is WorkBuddyModel => model !== undefined);
+}
+
+/** Timestamp from either an ISO string or a seconds/milliseconds epoch number. */
+function parseWorkBuddyTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && value > 1e12) return value;
+  if (typeof value === "string" && value !== "") {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+/** Format one `YYYY-MM-DD HH:mm:ss` local stamp, the shape the billing filter wants. */
+function formatWorkBuddyStamp(date: Date): string {
+  const pad = (value: number, width = 2) => value.toString().padStart(width, "0");
+  const day = `${pad(date.getFullYear(), 4)}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return `${day} ${time}`;
+}
+
+/** Credits expiring within this window are reported as "worth spending first". */
+const EXPIRING_SOON_MS = 72 * 60 * 60 * 1000;
+
+/**
+ * Fold the billing document into a per-package overview.
+ *
+ * Packages are kept separate on purpose: the dashboard groups recurring packages itself and
+ * lists the nearest-expiring one-off packages, so aggregating here would lose the dates it
+ * needs. `CapacityType === 4` marks a recurring (cycle) package — its live numbers live in
+ * the `Cycle*` fields and its cycle end is a refresh, not an expiry; every other package is
+ * a one-off whose remaining balance is authoritative.
+ */
+export function foldWorkBuddyCreditPackages(rawAccounts: unknown): WorkBuddyCredits {
+  const accounts = Array.isArray(rawAccounts) ? rawAccounts : [];
+  const packages: WorkBuddyCreditPackage[] = [];
+  let total = 0;
+  let expiringSoon = 0;
+  let nearestExpiryMs: number | undefined;
+
+  for (const raw of accounts) {
+    const account = asRecord(raw);
+    if (Object.keys(account).length === 0) continue;
+    const numberField = (key: string) => asNumber(account[key]) ?? 0;
+
+    const monthly = numberField("CapacityType") === 4;
+    const size = monthly ? numberField("CycleCapacitySize") : numberField("CapacitySize");
+    const remain = monthly ? numberField("CycleCapacityRemain") : numberField("CapacityRemain");
+    const cappedRemain = remain < 0 ? 0 : remain;
+
+    const cycleEndMs = parseWorkBuddyTimestamp(account.CycleEndTime);
+    const expiresAtMs = monthly
+      ? undefined
+      : (parseWorkBuddyTimestamp(account.ExpiredTime) ?? cycleEndMs);
+    const refreshAtMs = monthly && cycleEndMs !== undefined ? cycleEndMs + 1000 : undefined;
+
+    // A spent or expired one-off package contributes nothing; a recurring one always reports
+    // its current cycle's remaining balance.
+    if (
+      !monthly &&
+      (cappedRemain <= 0 || (expiresAtMs !== undefined && expiresAtMs <= Date.now()))
+    ) {
+      continue;
+    }
+
+    total += cappedRemain;
+    if (expiresAtMs !== undefined) {
+      if (nearestExpiryMs === undefined || expiresAtMs < nearestExpiryMs)
+        nearestExpiryMs = expiresAtMs;
+      if (expiresAtMs - Date.now() <= EXPIRING_SOON_MS) expiringSoon += cappedRemain;
+    }
+
+    packages.push({
+      packageName: asString(account.PackageName) ?? "(unnamed)",
+      remain: cappedRemain,
+      size,
+      monthly,
+      ...(refreshAtMs === undefined ? {} : { refreshAtMs }),
+      ...(expiresAtMs === undefined ? {} : { expiresAtMs }),
+    });
+  }
+
+  return {
+    total,
+    packages,
+    expiringSoon,
+    ...(nearestExpiryMs === undefined ? {} : { nearestExpiryMs }),
+  };
+}
+
+/**
+ * Headers the model directory is read with.
+ *
+ * The user agent is not cosmetic: `/v3/config` serves a DIFFERENT roster per client channel,
+ * and the CLI channel omits the free `x0.00` tier. This addon therefore always asks as the
+ * desktop app (plan §A2/R5) — one edition means one static value is correct.
+ */
+function workBuddyCatalogHeaders(credential: WorkBuddyCredential): Record<string, string> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${credential.accessToken}`,
+    Accept: "application/json",
+    "User-Agent": WORKBUDDY_DESKTOP_USER_AGENT,
+  };
+  if (credential.uid) headers["X-User-Id"] = credential.uid;
+  if (credential.domain) headers["X-Domain"] = credential.domain;
+  headers["X-Product"] = "SaaS";
+  headers["X-Requested-With"] = "XMLHttpRequest";
+  headers.Connection = "close";
+  return headers;
+}
+
+/** One catalogue read: the envelope, the roster document and the selected models. */
+interface WorkBuddyCatalogRead {
+  models: WorkBuddyModel[];
+  status: number;
+  code: number;
+}
+
+/** GET the catalogue path and select its models; throws on a non-zero envelope. */
+async function readWorkBuddyCatalog(
+  credential: WorkBuddyCredential,
+  base: string,
+  path: string,
+  callerSignal?: AbortSignal
+): Promise<WorkBuddyCatalogRead> {
+  const response = await fetch(`${base}${path}`, {
+    method: "GET",
+    headers: workBuddyCatalogHeaders(credential),
+    signal: callerSignal ?? AbortSignal.timeout(WORKBUDDY_JSON_TIMEOUT_MS),
+  });
+  const envelope = await readWorkBuddyEnvelope(response);
+  if (!response.ok || envelope.code !== 0)
+    envelopeError(response, envelope, "WorkBuddy model directory");
+
+  const data = asRecord(envelope.data);
+  return {
+    models: selectWorkBuddyCatalogModels(data.models, data.agents),
+    status: response.status,
+    code: envelope.code,
+  };
+}
+
+/** Reject an empty roster, so a catalogue read can never silently disarm the provider. */
+function requireWorkBuddyCatalog(read: WorkBuddyCatalogRead): WorkBuddyModel[] {
+  if (read.models.length === 0) {
+    // Typed, so a caller can answer with the previous rows instead of writing an empty
+    // catalogue (see WorkBuddyEmptyCatalogError).
+    throw new WorkBuddyEmptyCatalogError(read.status, read.code || null);
+  }
+  return read.models;
+}
+
+/**
+ * Read the model directory for a credential.
+ *
+ * `/v3/config` is the document the WorkBuddy app itself consumes, so the roster and the
+ * prices agree with the app. There is no legacy fallback: that path answers HTTP 500 on this
+ * gateway, so falling back would only replace a clear error with a misleading one.
+ */
+export async function fetchWorkBuddyModels(
+  credential: WorkBuddyCredential,
+  options: { signal?: AbortSignal } = {}
+): Promise<WorkBuddyModel[]> {
+  const read = await readWorkBuddyCatalog(
+    credential,
+    workBuddyBillingBase(credential.domain),
+    WORKBUDDY_CONFIG_PATH,
+    options.signal
+  );
+  return requireWorkBuddyCatalog(read);
+}
+
+/** Read every credit package for a credential, keeping packages separate. */
+export async function fetchWorkBuddyCredits(
+  credential: WorkBuddyCredential
+): Promise<WorkBuddyCredits> {
+  const now = new Date();
+  const response = await fetch(
+    `${workBuddyBillingBase(credential.domain)}${WORKBUDDY_CREDITS_PATH}`,
+    {
+      method: "POST",
+      headers: buildWorkBuddyBillingHeaders(credential),
+      body: JSON.stringify({
+        PageNumber: 1,
+        PageSize: 100,
+        ProductCode: WORKBUDDY_CREDIT_PRODUCT_CODE,
+        Status: [0, 3],
+        PackageEndTimeRangeBegin: formatWorkBuddyStamp(now),
+        // The upstream wants a bounded window; the reference client asks for 100 years.
+        PackageEndTimeRangeEnd: formatWorkBuddyStamp(new Date(now.getTime() + 3_185_136_000_000)),
+      }),
+      signal: AbortSignal.timeout(WORKBUDDY_JSON_TIMEOUT_MS),
+    }
+  );
+  const envelope = await readWorkBuddyEnvelope(response);
+  if (!response.ok || envelope.code !== 0)
+    envelopeError(response, envelope, "WorkBuddy credit query");
+
+  const wrapper = asRecord(envelope.data);
+  const inner = asRecord(asRecord(wrapper.Response).Data);
+  return foldWorkBuddyCreditPackages(inner.Accounts);
 }

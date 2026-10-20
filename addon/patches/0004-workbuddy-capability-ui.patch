@@ -1,0 +1,388 @@
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx
+index df6d09af..00c6a833 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx
+@@ -16,6 +16,7 @@ import ModelEndpointTagsEditor, { type ModelEndpointEditorInfo } from "./ModelEn
+ import ModelOutputTokenEditor from "./ModelOutputTokenEditor";
+ import { ModelSourceBadge, type ModelCompatSavePatch } from "./ModelRow";
+ import { WorkBuddyCreditBadge } from "./WorkBuddyCreditBadge";
++import { WorkBuddyReasoningEffortEditor } from "./WorkBuddyReasoningEffortEditor";
+ 
+ // ---------------------------------------------------------------------------
+ // Props
+@@ -65,6 +66,18 @@ export interface PassthroughModelRowProps {
+   contextWindowOverride?: number | null;
+   onSaveContextWindowOverride?: (modelId: string, value: number | null) => Promise<void>;
+   savingContextOverride?: boolean;
++  /**
++   * Feature D (plan §6): flip the vision override through the SAME PUT that has always accepted
++   * `supportsVision` on the compatOnly branch (`provider.ts:313`), and narrow the persisted
++   * reasoning-effort ladder. Both are absent for a row that cannot take an override, which keeps
++   * every other caller exactly as it was.
++   */
++  onSaveSupportsVision?: (modelId: string, value: boolean | null) => Promise<void>;
++  savingVision?: boolean;
++  reasoningEfforts?: readonly string[];
++  onSaveReasoningEfforts?: (modelId: string, efforts: string[]) => Promise<void> | void;
++  onClearReasoningEfforts?: (modelId: string) => Promise<void> | void;
++  savingReasoningEfforts?: boolean;
+   endpointInfo?: ModelEndpointEditorInfo;
+ }
+ 
+@@ -105,6 +118,12 @@ export default function PassthroughModelRow({
+   contextWindowOverride,
+   onSaveContextWindowOverride,
+   savingContextOverride,
++  onSaveSupportsVision,
++  savingVision,
++  reasoningEfforts,
++  onSaveReasoningEfforts,
++  onClearReasoningEfforts,
++  savingReasoningEfforts,
+   endpointInfo,
+ }: PassthroughModelRowProps) {
+   const [editing, setEditing] = useState(false);
+@@ -256,6 +275,39 @@ export default function PassthroughModelRow({
+               {t("visionCapableLabel")}
+             </Badge>
+           )}
++          {onSaveSupportsVision && (
++            <button
++              type="button"
++              onClick={() => void onSaveSupportsVision(modelId, supportsVision !== true)}
++              disabled={savingVision}
++              className={`rounded p-0.5 hover:bg-sidebar disabled:opacity-40 disabled:cursor-not-allowed ${
++                supportsVision === true ? "text-emerald-500" : "text-text-muted"
++              }`}
++              title={
++                supportsVision === true
++                  ? "Vision capability is ON for this model — click to turn it off"
++                  : "Vision capability is OFF for this model — click to turn it on"
++              }
++              aria-label="Toggle vision capability override"
++            >
++              <span className="material-symbols-outlined text-sm">
++                {savingVision
++                  ? "progress_activity"
++                  : supportsVision === true
++                    ? "visibility"
++                    : "visibility_off"}
++              </span>
++            </button>
++          )}
++          {onSaveReasoningEfforts && (
++            <WorkBuddyReasoningEffortEditor
++              modelId={modelId}
++              selected={reasoningEfforts ?? []}
++              saving={savingReasoningEfforts}
++              onSave={onSaveReasoningEfforts}
++              onClear={onClearReasoningEfforts ?? (async () => undefined)}
++            />
++          )}
+           <ModelOutputTokenEditor
+             modelId={modelId}
+             value={maxOutputTokenOverride}
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelsSection.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelsSection.tsx
+index 9c23f57b..140bd446 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelsSection.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelsSection.tsx
+@@ -13,7 +13,7 @@ import { filterUnavailableModelRows } from "@/lib/providers/mergeProviderModelLi
+  *
+  * Never imports from ProviderDetailPageClient.
+  */
+-import React, { useState, useMemo } from "react";
++import React, { useState, useMemo, useCallback, useEffect } from "react";
+ import { Button } from "@/shared/components";
+ import { generateUniqueModelAlias } from "./passthroughAlias.ts";
+ import {
+@@ -29,14 +29,20 @@ import {
+   evaluateTestAllEntry,
+   buildPassthroughTestBody,
+   shouldSwitchToVisibleFilter,
++  formatProviderModelsErrorResponse,
+   type CompatModelRow,
+   type CompatByProtocolMap,
+ } from "../providerPageHelpers";
+ import { ModelVisibilityToolbar } from "./ModelRow";
+ import { sortModelsFreeFirst, isModelFreeBadge } from "@/shared/utils/freeModels";
+-import { declaredWorkBuddyCreditMultiplier } from "@/shared/utils/workBuddyCredit";
++import {
++  declaredWorkBuddyCreditMultiplier,
++  isWorkBuddyProviderId,
++} from "@/shared/utils/workBuddyCredit";
++import { parseWorkBuddyEfforts, serializeWorkBuddyEfforts } from "@/shared/utils/workBuddyEfforts";
+ import { useStrictFreeBadge } from "./useStrictFreeBadge";
+ import PassthroughModelRow from "./PassthroughModelRow";
++import { useModelContextOverrides } from "../hooks/useModelContextOverrides";
+ 
+ // ---------------------------------------------------------------------------
+ // Props
+@@ -150,6 +156,204 @@ export default function PassthroughModelsSection({
+   const strictFreeBadge = useStrictFreeBadge();
+   const customModelMap = useMemo(() => buildCompatMap(customModels), [customModels]);
+ 
++  // ── Feature D (plan §6) — capability editors on the passthrough list ──────────────────────
++  // The three editors persist through the platform's existing APIs, one storage path each:
++  //   * context window  → PUT /api/provider-models {contextWindowOverride}  (compatOnly branch)
++  //   * vision override → PUT /api/provider-models {supportsVision}
++  //   * effort ladder   → PATCH|DELETE /api/model-capability-overrides (key reasoning_efforts)
++  // No new endpoint and no new schema: the override APIs are already provider-scoped (D7).
++  const contextOverrides = useModelContextOverrides(providerId);
++  const [visionOverrides, setVisionOverrides] = useState<Record<string, boolean>>({});
++  const [savingVisionModelId, setSavingVisionModelId] = useState<string | null>(null);
++  const [effortOverrides, setEffortOverrides] = useState<Record<string, string[]>>({});
++  const [savingEffortModelId, setSavingEffortModelId] = useState<string | null>(null);
++  // The effort editor is WorkBuddy-only: its vocabulary IS the gateway ladder, and offering it
++  // for a provider whose efforts come from elsewhere would be a lie.
++  const workBuddyProvider = isWorkBuddyProviderId(providerId);
++
++  // Vision overrides live in the modelCompatOverrides block; the row data itself may be
++  // discovery-derived (which is why an explicit override has to win at render time).
++  useEffect(() => {
++    const run = async () => {
++      try {
++        const res = await fetch(`/api/provider-models?provider=${encodeURIComponent(providerId)}`);
++        if (!res.ok) return;
++        const body = await res.json();
++        const rows = Array.isArray(body?.modelCompatOverrides) ? body.modelCompatOverrides : [];
++        const next: Record<string, boolean> = {};
++        for (const row of rows) {
++          if (typeof row?.modelId !== "string") continue;
++          if (typeof row.supportsVision === "boolean") next[row.modelId] = row.supportsVision;
++        }
++        setVisionOverrides(next);
++      } catch {
++        // A failed read leaves the discovered value in place; editing still works.
++      }
++    };
++    void run();
++  }, [providerId]);
++
++  const loadEffortOverrides = useCallback(async () => {
++    try {
++      const res = await fetch("/api/model-capability-overrides");
++      if (!res.ok) return;
++      const body = await res.json();
++      const rows = Array.isArray(body?.overrides) ? body.overrides : [];
++      const prefix = `${providerId}/`;
++      const next: Record<string, string[]> = {};
++      for (const row of rows) {
++        if (row?.key !== "reasoning_efforts") continue;
++        if (typeof row?.target !== "string" || !row.target.startsWith(prefix)) continue;
++        const modelId = row.target.slice(prefix.length);
++        if (!modelId) continue;
++        const value = Array.isArray(row.value)
++          ? row.value.filter((entry: unknown): entry is string => typeof entry === "string")
++          : [];
++        if (value.length > 0) next[modelId] = parseWorkBuddyEfforts(value.join(","));
++      }
++      setEffortOverrides(next);
++    } catch {
++      // Same contract as the vision read: absent values, not a broken page.
++    }
++  }, [providerId]);
++
++  useEffect(() => {
++    const run = async () => {
++      await loadEffortOverrides();
++    };
++    void run();
++  }, [loadEffortOverrides]);
++
++  const saveContextWindow = useCallback(
++    async (modelId: string, value: number | null) => {
++      const result = await contextOverrides.save(modelId, value);
++      if (result.invalid) {
++        notify.error(t("contextWindowOverrideInvalid"));
++        return;
++      }
++      if (!result.ok) {
++        notify.error(
++          result.error ||
++            providerText(
++              t,
++              "failedSaveModelEndpointSettings",
++              "Failed to save model endpoint settings"
++            )
++        );
++        return;
++      }
++      notify.success(
++        providerText(t, "savedModelEndpointSettings", "Saved model endpoint settings")
++      );
++    },
++    [contextOverrides, notify, t]
++  );
++
++  const saveSupportsVision = useCallback(
++    async (modelId: string, value: boolean | null) => {
++      setSavingVisionModelId(modelId);
++      try {
++        const res = await fetch("/api/provider-models", {
++          method: "PUT",
++          headers: { "Content-Type": "application/json" },
++          body: JSON.stringify({ provider: providerId, modelId, supportsVision: value }),
++        });
++        if (!res.ok) {
++          throw new Error(await formatProviderModelsErrorResponse(res));
++        }
++        setVisionOverrides((current) => {
++          const next = { ...current };
++          if (value === null) delete next[modelId];
++          else next[modelId] = value;
++          return next;
++        });
++        notify.success(
++          providerText(t, "savedModelEndpointSettings", "Saved model endpoint settings")
++        );
++      } catch (error) {
++        notify.error(
++          error instanceof Error && error.message
++            ? error.message
++            : providerText(
++                t,
++                "failedSaveModelEndpointSettings",
++                "Failed to save model endpoint settings"
++              )
++        );
++      } finally {
++        setSavingVisionModelId(null);
++      }
++    },
++    [providerId, notify, t]
++  );
++
++  const clearReasoningEfforts = useCallback(
++    async (modelId: string) => {
++      setSavingEffortModelId(modelId);
++      try {
++        const query = new URLSearchParams({
++          target: `${providerId}/${modelId}`,
++          key: "reasoning_efforts",
++        });
++        const res = await fetch(`/api/model-capability-overrides?${query.toString()}`, {
++          method: "DELETE",
++        });
++        if (!res.ok) throw new Error(`HTTP ${res.status}`);
++        setEffortOverrides((current) => {
++          const next = { ...current };
++          delete next[modelId];
++          return next;
++        });
++      } catch (error) {
++        notify.error(
++          error instanceof Error && error.message
++            ? error.message
++            : "Failed to clear the reasoning-effort override"
++        );
++      } finally {
++        setSavingEffortModelId(null);
++      }
++    },
++    [providerId, notify]
++  );
++
++  const saveReasoningEfforts = useCallback(
++    async (modelId: string, values: string[]) => {
++      const serialized = serializeWorkBuddyEfforts(values);
++      if (serialized === "") {
++        // An empty selection is not a value: clearing is the only honest write.
++        await clearReasoningEfforts(modelId);
++        return;
++      }
++      setSavingEffortModelId(modelId);
++      try {
++        const res = await fetch("/api/model-capability-overrides", {
++          method: "PATCH",
++          headers: { "Content-Type": "application/json" },
++          body: JSON.stringify({
++            target: `${providerId}/${modelId}`,
++            key: "reasoning_efforts",
++            value: serialized,
++          }),
++        });
++        if (!res.ok) throw new Error(`HTTP ${res.status}`);
++        setEffortOverrides((current) => ({
++          ...current,
++          [modelId]: parseWorkBuddyEfforts(serialized),
++        }));
++      } catch (error) {
++        notify.error(
++          error instanceof Error && error.message
++            ? error.message
++            : "Failed to save the reasoning-effort override"
++        );
++      } finally {
++        setSavingEffortModelId(null);
++      }
++    },
++    [providerId, notify, clearReasoningEfforts]
++  );
++
+   const handleTestAll = async () => {
+     const modelsToTest = filteredModels.filter((m) => !m.isHidden);
+     if (modelsToTest.length === 0) {
+@@ -244,6 +448,8 @@ export default function PassthroughModelsSection({
+       isHidden: boolean;
+       /** Declared credit rate from the discovery/catalogue row (WorkBuddy only). */
+       creditMultiplier?: number;
++      /** Discovery/provider verdict; an explicit operator override wins at render time. */
++      supportsVision?: boolean;
+     }> = [];
+     const seenModelIds = new Set<string>();
+ 
+@@ -278,6 +484,7 @@ export default function PassthroughModelsSection({
+         ),
+         isHidden: isModelHidden(model.id),
+         creditMultiplier: declaredWorkBuddyCreditMultiplier(model),
++        supportsVision: model.supportsVision,
+       });
+       seenModelIds.add(model.id);
+     };
+@@ -322,6 +529,7 @@ export default function PassthroughModelsSection({
+         ),
+         isHidden: isModelHidden(modelId),
+         creditMultiplier: declaredWorkBuddyCreditMultiplier(customModel),
++        supportsVision: customModel?.supportsVision,
+       });
+       seenModelIds.add(modelId);
+     }
+@@ -455,7 +663,16 @@ export default function PassthroughModelsSection({
+           />
+           <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+             {displayModels.map(
+-              ({ modelId, fullModel, alias, isHidden, source, isFree, creditMultiplier }) => (
++              ({
++                modelId,
++                fullModel,
++                alias,
++                isHidden,
++                source,
++                isFree,
++                creditMultiplier,
++                supportsVision,
++              }) => (
+                 <PassthroughModelRow
+                   key={fullModel as string}
+                   modelId={modelId}
+@@ -487,6 +704,20 @@ export default function PassthroughModelsSection({
+                   isFree={isFree}
+                   creditMultiplier={creditMultiplier}
+                   isHidden={isHidden}
++                  supportsVision={visionOverrides[modelId] ?? supportsVision}
++                  onSaveSupportsVision={saveSupportsVision}
++                  savingVision={savingVisionModelId === modelId}
++                  contextWindowOverride={contextOverrides.overrides[modelId] ?? null}
++                  onSaveContextWindowOverride={saveContextWindow}
++                  savingContextOverride={contextOverrides.savingModelId === modelId}
++                  {...(workBuddyProvider
++                    ? {
++                        reasoningEfforts: effortOverrides[modelId] ?? [],
++                        onSaveReasoningEfforts: saveReasoningEfforts,
++                        onClearReasoningEfforts: clearReasoningEfforts,
++                        savingReasoningEfforts: savingEffortModelId === modelId,
++                      }
++                    : {})}
+                   copied={copied}
+                   onCopy={onCopy}
+                   onDeleteAlias={

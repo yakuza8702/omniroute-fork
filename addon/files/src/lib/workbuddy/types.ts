@@ -88,6 +88,73 @@ export interface WorkBuddyModelReasoning {
   canDisableThinking?: boolean;
 }
 
+/**
+ * Credential read back out of a stored connection.
+ *
+ * A WorkBuddy login is an ordinary platform connection: `accessToken`/`refreshToken` plus
+ * the account identity in `providerSpecificData` (see {@link WORKBUDDY_CONNECTION_KEYS}).
+ * The identity is NOT decoration — the gateway needs `X-Domain`/`X-User-Id` on the wire,
+ * and those are per-connection, so a static header table could not carry them.
+ *
+ * The token never leaves the server: no route returns this object, only its non-secret
+ * fields (label, masked account, connected bit).
+ */
+export interface WorkBuddyCredential {
+  accessToken: string;
+  refreshToken: string;
+  /** Login domain (`www.workbuddy.ai` / `www.codebuddy.ai`); picks the brand gateway. */
+  domain: string;
+  uid?: string;
+  enterpriseId?: string;
+  /** Display name of the account, never a secret. */
+  nickname?: string;
+  /** Where the credential came from. This port only reads platform connections. */
+  source?: "connection";
+}
+
+/** One credit package as the billing endpoint reports it. */
+export interface WorkBuddyCreditPackage {
+  packageName: string;
+  /** Remaining credits, clamped at 0. */
+  remain: number;
+  size: number;
+  /** Refill package (recurring cycle) vs one-off bonus package. */
+  monthly: boolean;
+  /** Next cycle refresh (refill packages only). */
+  refreshAtMs?: number;
+  /** Hard expiry (one-off packages; falls back to the cycle end). */
+  expiresAtMs?: number;
+}
+
+/** Credit overview for one credential. */
+export interface WorkBuddyCredits {
+  total: number;
+  packages: WorkBuddyCreditPackage[];
+  /** Credits expiring within 72h — the ones worth spending first. */
+  expiringSoon: number;
+  /** Nearest expiry across all packages. */
+  nearestExpiryMs?: number;
+}
+
+/**
+ * Keys this addon owns inside a connection's `providerSpecificData`.
+ *
+ * Declared here (and not next to the DB helpers) because both the routes and any future
+ * executor read the account identity from these names: a rename that reached only one side
+ * would send requests with no `X-Domain`/`X-User-Id`, which this gateway answers with an
+ * HTML 401 rather than a helpful error.
+ */
+export const WORKBUDDY_CONNECTION_KEYS = {
+  domain: "workbuddyDomain",
+  uid: "workbuddyUid",
+  enterpriseId: "workbuddyEnterpriseId",
+  region: "workbuddyRegion",
+  source: "workbuddySource",
+  sourceFilePath: "workbuddySourceFilePath",
+  accountLabel: "workbuddyAccountLabel",
+  expiresAtMs: "workbuddyExpiresAtMs",
+} as const;
+
 /** One entry of the upstream model directory. */
 export interface WorkBuddyModel {
   id: string;
@@ -171,4 +238,30 @@ export function isWorkBuddyProviderId(providerId: unknown): boolean {
  */
 export function workBuddyAddonEnabled(): boolean {
   return !/^(0|false|no|off)$/i.test((process.env.WORKBUDDY_ADDON ?? "1").trim());
+}
+
+/**
+ * Gateway for an international credential.
+ *
+ * Both brand domains serve the same international stack, but a token minted at one is
+ * rejected at the other, so the base follows the credential's own domain. Anything
+ * unrecognised falls back to the desktop app's gateway. There is no domestic branch in this
+ * addon (single edition, plan §D1): every credential it reads is global.
+ */
+export function resolveWorkBuddyGlobalBase(domain: string | undefined | null): string {
+  const lowered = (domain ?? "").trim().toLowerCase();
+  if (lowered === "codebuddy.ai" || lowered.endsWith(".codebuddy.ai")) {
+    return WORKBUDDY_ALT_BASE;
+  }
+  return WORKBUDDY_CHAT_BASE;
+}
+
+/** Chat gateway for a credential (the billing host is the same origin upstream). */
+export function workBuddyChatBase(domain: string | undefined | null): string {
+  return resolveWorkBuddyGlobalBase(domain);
+}
+
+/** Billing/credit gateway for a credential. */
+export function workBuddyBillingBase(domain: string | undefined | null): string {
+  return resolveWorkBuddyGlobalBase(domain);
 }

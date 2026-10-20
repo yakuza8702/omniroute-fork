@@ -1,0 +1,318 @@
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/CompatibleModelsSection.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/CompatibleModelsSection.tsx
+index 241d838a..3bf2c378 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/CompatibleModelsSection.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/CompatibleModelsSection.tsx
+@@ -25,6 +25,7 @@ import {
+ } from "../providerPageHelpers";
+ import { ModelVisibilityToolbar } from "./ModelRow";
+ import { sortModelsFreeFirst, isModelFreeBadge } from "@/shared/utils/freeModels";
++import { declaredWorkBuddyCreditMultiplier } from "@/shared/utils/workBuddyCredit";
+ import { useStrictFreeBadge } from "./useStrictFreeBadge";
+ import { useModelOutputOverrides } from "../hooks/useModelOutputOverrides";
+ import PassthroughModelRow, { type PassthroughModelRowProps } from "./PassthroughModelRow";
+@@ -256,6 +257,8 @@ export default function CompatibleModelsSection({
+       isFree: boolean;
+       isHidden: boolean;
+       supportsVision?: boolean;
++      /** Declared credit rate from the discovery/catalogue row (WorkBuddy only). */
++      creditMultiplier?: number;
+     }> = [];
+     const seenModelIds = new Set<string>();
+ 
+@@ -285,6 +288,7 @@ export default function CompatibleModelsSection({
+         ),
+         isHidden: isModelHidden(model.id),
+         supportsVision: model.supportsVision,
++        creditMultiplier: declaredWorkBuddyCreditMultiplier(model),
+       });
+       seenModelIds.add(model.id);
+     };
+@@ -328,6 +332,7 @@ export default function CompatibleModelsSection({
+         ),
+         isHidden: isModelHidden(modelId),
+         supportsVision: customModel?.supportsVision,
++        creditMultiplier: declaredWorkBuddyCreditMultiplier(customModel),
+       });
+       seenModelIds.add(modelId);
+     }
+@@ -558,7 +563,16 @@ export default function CompatibleModelsSection({
+           />
+           <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+             {displayModels.map(
+-              ({ modelId, alias, displayName, isHidden, source, isFree, supportsVision }) => {
++              ({
++                modelId,
++                alias,
++                displayName,
++                isHidden,
++                source,
++                isFree,
++                supportsVision,
++                creditMultiplier,
++              }) => {
+                 const fullModel = `${providerDisplayAlias}/${modelId}`;
+                 return (
+                   <PassthroughModelRow
+@@ -590,6 +604,7 @@ export default function CompatibleModelsSection({
+                     displayName={displayName}
+                     source={source}
+                     isFree={isFree}
++                    creditMultiplier={creditMultiplier}
+                     isHidden={isHidden}
+                     copied={copied}
+                     onCopy={onCopy}
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/ConnectionRow.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/ConnectionRow.tsx
+index cb2355e6..93fa83f5 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/ConnectionRow.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/ConnectionRow.tsx
+@@ -29,6 +29,8 @@ import {
+ } from "@/shared/utils/providerQuotaVisibility";
+ import ProviderQuotaVisibilityToggle from "./ProviderQuotaVisibilityToggle";
+ import CodexPingNowButton from "./CodexPingNowButton";
++import { WorkBuddyPoolCreditBadge } from "./WorkBuddyPoolCreditBadge";
++import { isWorkBuddyProviderId } from "@/shared/utils/workBuddyCredit";
+ 
+ // ---------------------------------------------------------------------------
+ // Types (exported so the client can reference them without re-importing)
+@@ -845,6 +847,18 @@ export default function ConnectionRow({
+           />
+         </div>
+       ) : null}
++      {/*
++        WorkBuddy credits live OUTSIDE the quotaPanelSupported gate: `workbuddy` is not in
++        USAGE_SUPPORTED_PROVIDERS and is not an openai-compatible-* id, so the Provider Limits
++        panel never renders a card for it and this badge is the only credits surface. Its first
++        paint is a snapshot read (`detail=fast`) — no upstream traffic — and the refresh action
++        is the only path that spends a billing call.
++      */}
++      {isWorkBuddyProviderId(String(connection.provider || "")) ? (
++        <div className="basis-full min-w-0">
++          <WorkBuddyPoolCreditBadge connectionId={connection.id} />
++        </div>
++      ) : null}
+     </div>
+   );
+ }
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/ModelRow.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/ModelRow.tsx
+index e9734133..1556d504 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/ModelRow.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/ModelRow.tsx
+@@ -18,6 +18,7 @@ import {
+ import { providerText } from "../providerPageHelpers";
+ import ModelCompatPopover from "./ModelCompatPopover";
+ import ModelEndpointTagsEditor, { type ModelEndpointEditorInfo } from "./ModelEndpointTagsEditor";
++import { WorkBuddyCreditBadge } from "./WorkBuddyCreditBadge";
+ 
+ // ---------------------------------------------------------------------------
+ // Shared prop types
+@@ -261,7 +262,14 @@ export function ModelVisibilityToolbar({
+ // ---------------------------------------------------------------------------
+ 
+ export interface ModelRowProps {
+-  model: { id: string; name?: string; source?: string; isHidden?: boolean };
++  model: {
++    id: string;
++    name?: string;
++    source?: string;
++    isHidden?: boolean;
++    /** Declared credit rate carried by the synced row (WorkBuddy only). */
++    creditMultiplier?: number;
++  };
+   fullModel: string;
+   provider: string;
+   alias?: string;
+@@ -375,6 +383,7 @@ export default function ModelRow({
+       {/* Line 2 (never wraps): source, alias (truncates) and the actions, in the name's column. */}
+       <div className="flex min-w-0 items-center gap-2 pl-6">
+         <ModelSourceBadge source={model.source} />
++        <WorkBuddyCreditBadge provider={provider} creditMultiplier={model.creditMultiplier} />
+         {onSetAlias && (
+           <span className="flex min-w-0 flex-1 items-center text-[10px] gap-1">
+             {editing ? (
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx
+index 9ec7b0d4..df6d09af 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx
+@@ -15,6 +15,7 @@ import ModelCompatPopover from "./ModelCompatPopover";
+ import ModelEndpointTagsEditor, { type ModelEndpointEditorInfo } from "./ModelEndpointTagsEditor";
+ import ModelOutputTokenEditor from "./ModelOutputTokenEditor";
+ import { ModelSourceBadge, type ModelCompatSavePatch } from "./ModelRow";
++import { WorkBuddyCreditBadge } from "./WorkBuddyCreditBadge";
+ 
+ // ---------------------------------------------------------------------------
+ // Props
+@@ -31,6 +32,11 @@ export interface PassthroughModelRowProps {
+   displayName?: string | null;
+   source?: string;
+   isFree?: boolean;
++  /**
++   * Declared credit rate carried by the synced row (WorkBuddy only). The badge itself is gated
++   * on the provider id, so every other provider's row renders exactly as before.
++   */
++  creditMultiplier?: number | null;
+   isHidden?: boolean;
+   copied?: string;
+   onCopy: (text: string, key: string) => void;
+@@ -73,6 +79,7 @@ export default function PassthroughModelRow({
+   displayName,
+   source,
+   isFree,
++  creditMultiplier,
+   isHidden,
+   copied,
+   onCopy,
+@@ -235,6 +242,7 @@ export default function PassthroughModelRow({
+       <div className="flex min-w-0 items-center justify-between gap-2">
+         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+           <ModelSourceBadge source={source} />
++          <WorkBuddyCreditBadge provider={provider} creditMultiplier={creditMultiplier} />
+           {endpointInfo && (
+             <ModelEndpointTagsEditor
+               provider={provider}
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelsSection.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelsSection.tsx
+index 549e7202..9c23f57b 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelsSection.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelsSection.tsx
+@@ -34,6 +34,7 @@ import {
+ } from "../providerPageHelpers";
+ import { ModelVisibilityToolbar } from "./ModelRow";
+ import { sortModelsFreeFirst, isModelFreeBadge } from "@/shared/utils/freeModels";
++import { declaredWorkBuddyCreditMultiplier } from "@/shared/utils/workBuddyCredit";
+ import { useStrictFreeBadge } from "./useStrictFreeBadge";
+ import PassthroughModelRow from "./PassthroughModelRow";
+ 
+@@ -241,6 +242,8 @@ export default function PassthroughModelsSection({
+       source: string;
+       isFree: boolean;
+       isHidden: boolean;
++      /** Declared credit rate from the discovery/catalogue row (WorkBuddy only). */
++      creditMultiplier?: number;
+     }> = [];
+     const seenModelIds = new Set<string>();
+ 
+@@ -274,6 +277,7 @@ export default function PassthroughModelsSection({
+           { strict: strictFreeBadge }
+         ),
+         isHidden: isModelHidden(model.id),
++        creditMultiplier: declaredWorkBuddyCreditMultiplier(model),
+       });
+       seenModelIds.add(model.id);
+     };
+@@ -317,6 +321,7 @@ export default function PassthroughModelsSection({
+           { strict: strictFreeBadge }
+         ),
+         isHidden: isModelHidden(modelId),
++        creditMultiplier: declaredWorkBuddyCreditMultiplier(customModel),
+       });
+       seenModelIds.add(modelId);
+     }
+@@ -449,55 +454,60 @@ export default function PassthroughModelsSection({
+             onSortFreeFirstChange={setSortFreeFirst}
+           />
+           <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+-            {displayModels.map(({ modelId, fullModel, alias, isHidden, source, isFree }) => (
+-              <PassthroughModelRow
+-                key={fullModel as string}
+-                modelId={modelId}
+-                fullModel={fullModel}
+-                provider={providerId}
+-                endpointInfo={(() => {
+-                  const discovered = availableModels.find((row) => row.id === modelId);
+-                  const selected = customModelMap.get(modelId);
+-                  const catalog = catalogModels.find((row) => row.id === modelId);
+-                  return {
+-                    supportedEndpoints:
+-                      selected?.supportedEndpoints ??
+-                      discovered?.supportedEndpoints ??
+-                      catalog?.supportedEndpoints,
+-                    endpointCapabilitySource:
+-                      selected?.endpointCapabilitySource ??
+-                      discovered?.endpointCapabilitySource ??
+-                      catalog?.endpointCapabilitySource,
+-                    discoveredEndpoints: discovered?.supportedEndpoints,
+-                    resettable: Boolean(
+-                      discovered && selected?.endpointCapabilitySource === "operator"
+-                    ),
+-                    onChanged: onModelsChanged,
+-                    adapterStatuses: endpointAdapters,
+-                  };
+-                })()}
+-                alias={alias}
+-                source={source}
+-                isFree={isFree}
+-                isHidden={isHidden}
+-                copied={copied}
+-                onCopy={onCopy}
+-                onDeleteAlias={source === "alias" && alias ? () => onDeleteAlias(alias) : undefined}
+-                onSetAlias={(a) => onSetAlias(modelId, a)}
+-                t={t}
+-                showDeveloperToggle
+-                effectiveModelNormalize={effectiveModelNormalize}
+-                effectiveModelPreserveDeveloper={effectiveModelPreserveDeveloper}
+-                getUpstreamHeadersRecord={(p) => getUpstreamHeadersRecord(modelId, p)}
+-                saveModelCompatFlags={saveModelCompatFlags}
+-                compatDisabled={compatSavingModelId === modelId}
+-                onToggleHidden={onToggleHidden}
+-                togglingHidden={togglingModelId === modelId}
+-                onTestModel={onTestModel}
+-                testStatus={modelTestStatus?.[modelId] || null}
+-                testingModel={testingModelId === modelId}
+-              />
+-            ))}
++            {displayModels.map(
++              ({ modelId, fullModel, alias, isHidden, source, isFree, creditMultiplier }) => (
++                <PassthroughModelRow
++                  key={fullModel as string}
++                  modelId={modelId}
++                  fullModel={fullModel}
++                  provider={providerId}
++                  endpointInfo={(() => {
++                    const discovered = availableModels.find((row) => row.id === modelId);
++                    const selected = customModelMap.get(modelId);
++                    const catalog = catalogModels.find((row) => row.id === modelId);
++                    return {
++                      supportedEndpoints:
++                        selected?.supportedEndpoints ??
++                        discovered?.supportedEndpoints ??
++                        catalog?.supportedEndpoints,
++                      endpointCapabilitySource:
++                        selected?.endpointCapabilitySource ??
++                        discovered?.endpointCapabilitySource ??
++                        catalog?.endpointCapabilitySource,
++                      discoveredEndpoints: discovered?.supportedEndpoints,
++                      resettable: Boolean(
++                        discovered && selected?.endpointCapabilitySource === "operator"
++                      ),
++                      onChanged: onModelsChanged,
++                      adapterStatuses: endpointAdapters,
++                    };
++                  })()}
++                  alias={alias}
++                  source={source}
++                  isFree={isFree}
++                  creditMultiplier={creditMultiplier}
++                  isHidden={isHidden}
++                  copied={copied}
++                  onCopy={onCopy}
++                  onDeleteAlias={
++                    source === "alias" && alias ? () => onDeleteAlias(alias) : undefined
++                  }
++                  onSetAlias={(a) => onSetAlias(modelId, a)}
++                  t={t}
++                  showDeveloperToggle
++                  effectiveModelNormalize={effectiveModelNormalize}
++                  effectiveModelPreserveDeveloper={effectiveModelPreserveDeveloper}
++                  getUpstreamHeadersRecord={(p) => getUpstreamHeadersRecord(modelId, p)}
++                  saveModelCompatFlags={saveModelCompatFlags}
++                  compatDisabled={compatSavingModelId === modelId}
++                  onToggleHidden={onToggleHidden}
++                  togglingHidden={togglingModelId === modelId}
++                  onTestModel={onTestModel}
++                  testStatus={modelTestStatus?.[modelId] || null}
++                  testingModel={testingModelId === modelId}
++                />
++              )
++            )}
+           </div>
+           {filteredModels.length === 0 && modelFilter && (
+             <p className="py-2 text-sm text-text-muted">

@@ -6,17 +6,20 @@
 #   1. `set -euo pipefail` — every failure aborts the build, never a partial overlay.
 #   2. copy `files/` over the checkout (new files only; no upstream file is replaced by a
 #      copy — those go through `patches/`),
-#   3. `git apply --check` EVERY patch before applying ANY of them, so a drifted anchor
-#      fails with a clean error and an unmodified tree,
+#   3. preflight the WHOLE series before applying ANY of it — cumulatively, against a throwaway
+#      index (`git apply --cached`), because later patches build on earlier ones, and only on a
+#      work tree that still matches HEAD (the replay's model of it). A drifted anchor fails with a
+#      clean error and an unmodified work tree,
 #   4. apply the patches in filename order,
 #   5. assert every post-condition marker with `node -e` (the overlay is fail-closed: a
 #      marker that is missing after patching means the tree is not what the next stage
 #      expects, and the build must stop here),
 #   6. print `overlay ok` plus the number of files copied.
 #
-# Re-running is NOT a no-op: `git apply --check` rejects an already-applied patch, so a
-# second run fails closed by design (the overlay describes a transition, and applying a
-# transition twice is a different request than applying it once).
+# Re-running is NOT a no-op: the overlay describes a transition, and applying a transition twice
+# is a different request than applying it once. A second run is refused because the work tree no
+# longer matches HEAD (and, for an uncommitted overlay, because the series no longer applies to
+# the index it starts from) — fail-closed by design.
 #
 # Usage:
 #   bash addon/overlay.sh [TARGET_ROOT]      # default: /src (Dockerfile.source fetch stage)
@@ -53,16 +56,49 @@ cp -a "$ADDON_DIR/files/." "$TARGET_ROOT/"
 echo "overlay: copied ${COPIED_FILES} file(s) into ${TARGET_ROOT}"
 
 # ── 2. preflight every patch BEFORE applying any ─────────────────────────────
-failed_checks=0
+#
+# The series is CUMULATIVE: from wave 3 on, a later patch builds on an earlier one (0004 edits
+# the same two components 0003 touched), so checking each patch against the *unpatched* work
+# tree would false-fail even though the series is correct. The preflight therefore replays the
+# series against a throwaway index:
+#
+#   * `GIT_INDEX_FILE` points at a scratch index seeded from HEAD (`read-tree`),
+#   * each patch is applied with `--cached`, which reads and writes blobs in the object
+#     database ONLY — the work tree is never touched, so a failure still leaves it pristine,
+#   * the first patch that does not apply aborts the run BEFORE anything reaches the work tree.
+#
+# The scratch index lives under the repository's own git dir (same filesystem, writable) rather
+# than $TMPDIR, which on a container build may be small or read-only.
+#
+# Because the replay starts from HEAD, it is only a faithful model of the apply phase when the
+# WORK TREE still matches HEAD. That is therefore a precondition, not an assumption: a checkout
+# with tracked modifications (the usual symptom of a second run) is refused up front with a clear
+# message instead of failing halfway through the apply phase.
+if ! git -C "$TARGET_ROOT" diff --quiet HEAD --; then
+  fail "work tree has changes relative to HEAD in $TARGET_ROOT; the overlay describes a transition from a pristine checkout (the patches are probably already applied) — nothing was applied"
+fi
+
+GIT_DIR_PATH="$(git -C "$TARGET_ROOT" rev-parse --git-path "workbuddy-overlay-preflight.$$")"
+case "$GIT_DIR_PATH" in
+  /*) PREFLIGHT_INDEX="$GIT_DIR_PATH" ;;
+  *) PREFLIGHT_INDEX="$TARGET_ROOT/$GIT_DIR_PATH" ;;
+esac
+cleanup_preflight() { rm -f "$PREFLIGHT_INDEX" "$PREFLIGHT_INDEX.lock"; }
+trap cleanup_preflight EXIT
+cleanup_preflight
+GIT_INDEX_FILE="$PREFLIGHT_INDEX" git -C "$TARGET_ROOT" read-tree HEAD ||
+  fail "could not seed the preflight index from HEAD in $TARGET_ROOT"
+
 for patch in "${PATCHES[@]}"; do
   name="$(basename "$patch")"
-  if ! git -C "$TARGET_ROOT" apply --check --whitespace=nowarn "$patch"; then
+  if ! GIT_INDEX_FILE="$PREFLIGHT_INDEX" \
+    git -C "$TARGET_ROOT" apply --cached --whitespace=nowarn "$patch"; then
     echo "overlay: ERROR — ${name} does not apply cleanly to ${TARGET_ROOT}" >&2
     echo "overlay:        (anchor drift, or the patch is already applied)" >&2
-    failed_checks=$((failed_checks + 1))
+    fail "the patch series stops at ${name}; nothing was applied to the work tree"
   fi
 done
-[ "$failed_checks" -eq 0 ] || fail "${failed_checks} patch(es) failed git apply --check; nothing was applied"
+echo "overlay: preflight passed for ${#PATCHES[@]} patch(es)"
 
 # ── 3. apply ─────────────────────────────────────────────────────────────────
 for patch in "${PATCHES[@]}"; do
@@ -107,6 +143,28 @@ const markers = [
   ["src/app/api/providers/[id]/sync-models/route.ts", "invalidateWorkBuddyModelCaches()"],
   ["tests/snapshots/executors/executor-map.json", "\"WorkBuddyExecutor\""],
   ["tests/unit/workbuddy-reasoning.test.ts", "override-first"],
+  // 0003 — Feature C (credits). The shared credit rule, the completed discovery mapping, the
+  // pooled quota engine, the credits route, and the one UI insertion that has no compile-time
+  // proof of its own (the badge is optional on every row, so a missing prop renders nothing).
+  ["src/shared/utils/workBuddyCredit.ts", "export function formatWorkBuddyCreditBadge("],
+  ["src/lib/workbuddy/modelDiscovery.ts", "export function workBuddyModelsToSyncedInput("],
+  ["src/lib/workbuddy/poolQuota.ts", "export async function probeWorkBuddyPoolCredits("],
+  ["src/app/api/workbuddy/credits/route.ts", "const poolWide = isEnabledFlag("],
+  [
+    "src/app/(dashboard)/dashboard/providers/[id]/components/ConnectionRow.tsx",
+    "WorkBuddyPoolCreditBadge connectionId={connection.id}",
+  ],
+  // 0004 — Feature D (capability editors). Two markers, one per editor path: the effort override
+  // (WorkBuddy-only) and the vision toggle (the generic compatOnly PUT).
+  ["src/shared/utils/workBuddyEfforts.ts", "export const WORKBUDDY_EFFORT_OVERRIDE_VALUES"],
+  [
+    "src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelsSection.tsx",
+    "onSaveReasoningEfforts: saveReasoningEfforts",
+  ],
+  [
+    "src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx",
+    "Toggle vision capability override",
+  ],
 ];
 
 let missing = 0;
