@@ -755,3 +755,136 @@ MARKER:                                         "user-agent":"WorkBuddy/5.5.2"
 `PATCH_WORKBUDDY_UA` is added to the Insertion 1 `ARG`/`ENV` block (Dockerfile:46-50) alongside
 `PATCH_WORKBUDDY_OAUTH` and `PATCH_OPENCODE_ANON`, defaulting `1` and carried into the image `ENV`
 so the toggle is observable at runtime like the others.
+
+---
+
+## 10. Patch v4 (free-suffix premium rule + gated stream force)
+
+### 10.1 Two new stages
+
+Both stages are inserted **inside the existing `if (on(process.env.PATCH_OPENCODE_ANON))` heredoc
+block**, immediately **after** the A3b v3 stage (i.e. after the `A3b` `else` closes at the current
+line 243 and before the A1 residual check), each with its own `patch()` call, id, and idempotency
+marker. They reuse the existing `patch()` helper and its fail-closed + idempotent contract (§7),
+so no custom-loop / per-file >1 handling is needed — both targets are single-file, single-anchor.
+
+**Target file (both stages, same file — verified pristine):**
+
+```
+dist/.build/next/server/chunks/open-sse_14vc3e4._.js
+```
+
+Anchored counts verified on the pristine `omniroute@3.8.52` tarball
+(`/workspace/orpkg/package/dist/.build/next/server/chunks/open-sse_14vc3e4._.js`):
+
+- `grep -c 'return n?!n.has(r):!r.endswith("-free")&&!E.has(r)}'` → **1** (C1)
+- `grep -c 'return b(i)&&(0,c.forgetAttempt)(i),{body:e,attempt:null};'` → **1** (C2)
+- Both anchors are unique across the **whole** `dist/.build/next` tree (count 1), and neither
+  replacement/marker string pre-exists.
+
+### 10.2 Root causes
+
+**Premium-set branch (C1).** The compiled `isPremiumOpencodeModel` answers from the **synced family
+free-set first**:
+
+```js
+function p(e,t){if("opencode-go"===t)return!0;let r=e.trim(),
+n=<synced-family-set build>;
+return n?!n.has(r):!r.endsWith("-free")&&!E.has(r)}
+```
+
+where `E = ["big-pickle","deepseek-v4.1-flash-free","mimo-v2.5-free","hy3-free",
+"nemotron-3-ultra-free","north-mini-code-free"]` (verified in the static set literal).
+
+When the synced family set `n` is non-null, the legacy `-free` / `!E.has(r)` test is **bypassed
+entirely** — the `!n.has(r)` leg decides. A model id that the gateway advertises as free but that
+is not yet (or cannot be) present in the synced family set is therefore classified **premium**, so
+the keyless anonymous lane returns `402 premium_model_requires_key` for a genuinely free id.
+
+**Non-stream contract (C2).** The gated free-tier lane is streamed-only upstream
+(`applyFreeTierRequestContract → {...record, stream:true}`, `opencodeFreeTierContract.ts:362`),
+but that contract switches off with
+`OPENCODE_FREE_TIER_REQUEST_CONTRACT=off`, while the executor's header synthesis
+`(t||l)&&(i.Accept="text/event-stream")` is a header, not a body field. A non-streaming body
+therefore reaches the gateway on the gated lane and is refused. The gated early-return is gated on
+`!f(r,n,o)` (i.e. `!isGatedFreeTierRequest`), so an insertion immediately after it runs **only on
+gated requests** and only when `e` is a plain object.
+
+### 10.3 Exact anchors / replacements / markers
+
+```
+C1-free-suffix
+  ANCHOR (count==1, unique in tree):  return n?!n.has(r):!r.endsWith("-free")&&!E.has(r)}
+  REPLACEMENT:                       return r.endsWith("-free")||E.has(r)?false:n?!n.has(r):!r.endsWith("-free")&&!E.has(r)}
+  MARKER (idempotency, == REPLACEMENT): same as replacement
+
+C2-stream-force
+  ANCHOR (count==1, unique in tree):  return b(i)&&(0,c.forgetAttempt)(i),{body:e,attempt:null};
+  REPLACEMENT:                        return b(i)&&(0,c.forgetAttempt)(i),{body:e,attempt:null};if(e&&"object"==typeof e){e.stream=!0,e.stream_options={include_usage:!0}}
+  MARKER (idempotency):               e.stream=!0,e.stream_options={include_usage:!0}
+```
+
+Semantics:
+
+- **C1**: `r.endsWith("-free") || E.has(r)` ⇒ `false` (always free), short-circuits the family
+  branch; unknown non-suffixed ids fall through to the **verbatim** original
+  `n?!n.has(r):!r.endsWith("-free")&&!E.has(r)` so legacy behaviour is preserved.
+- **C2**: the injected block is placed *after* the gated early-return, so ungated /
+  contract-off requests return unchanged; `e&&"object"==typeof e` guards non-object bodies.
+
+### 10.4 Placement / non-regression
+
+- A1, B1, B1v2, B3, A3b stages are **byte-identical** to v3 — not re-anchored, not re-touched.
+- The `chown`/version-gate/integrity block is **not** modified other than the two stages above.
+- Both C1 and C2 live under the existing `PATCH_OPENCODE_ANON` toggle (no new `ARG`/`ENV`), so
+  `--build-arg PATCH_OPENCODE_ANON=0` disables them together with B1/B1v2/B3 exactly as v3 did.
+- C1 and C2 both target `open-sse_14vc3e4._.js` — the **same** file B1/B1v2/B3 already live in,
+  so the total touched-file count for v4 is still **6** (the 3 A1 chunks + open-sse_14vc3e4 +
+  the 2 A3b registry chunks); C1 and C2 do not add new files.
+
+### 10.5 Validation table (full v4 payload against `/workspace/pkgtest_scratch4`)
+
+Run with `PKG_ROOT` override against a fresh pristine copy of the `omniroute@3.8.52` tarball;
+`payload_root.mjs` is the heredoc payload extracted from the Dockerfile with the single
+`const PKG = "/usr/local/lib/node_modules/omniroute"` line replaced by
+`const PKG = process.env.PKG_ROOT || "/usr/local/lib/node_modules/omniroute"`.
+
+| # | Case | Input | Expected | Result |
+| --- | --- | --- | --- | --- |
+| 1 | fresh pristine, all toggles ON | pristine package | A1 `3 matched / 3 written`, B1 `1/1`, B1v2 `1/1`, B3 `1/1`, A3b `2/2`, **C1 `1/1`**, **C2 `1/1`**, exit 0 | ✅ A1 `3/3`, B1 `1/1`, B1v2 `1/1`, B3 `1/1`, A3b `2/2`, C1 `1/1`, C2 `1/1`, exit 0 |
+| 2 | rerun on already-patched pkg | post-full-patch pkg | all no-op, 0 written, exit 0 | ✅ all `already patched (no-op)`, 0 written, exit 0 |
+| 3 | toggles off | `PATCH_WORKBUDDY_OAUTH=0 PATCH_OPENCODE_ANON=0 PATCH_WORKBUDDY_UA=0` | A1/B1/B1v2/B3/C1/C2/A3b all skipped, 0 writes, exit 0 | ✅ `[A1] skipped`, `[B1/B3] skipped`, `[A3b] skipped`, `[C1/C2] skipped`, exit 0; pristine manifest unchanged |
+| 4 | version gate | `VERSION=3.8.53` against 3.8.52 tree | `FATAL: installed package version 3.8.52 != VERSION 3.8.53`, exit 1 | ✅ exit 1, exact message |
+| 5 | node --check on touched files | post-full-patch | valid JS on all 6 files | ✅ `38v-rzudg0f4t.js`, `src_1j6-c_9._.js`, `src_0lfns24._.js`, `open-sse_14vc3e4._.js`, `_1frhb2o._.js`, `_1zyjnzr._.js` all OK ×6 |
+| 6a | C1 partial state (search absent AND marker absent) | pristine with C1 anchor removed | `FATAL[C1-free-suffix]: matched 0 file(s), expected 1`, exit 1 | ✅ exit 1 |
+| 6b | C2 partial state (search absent AND marker absent) | pristine with C2 anchor removed (then C1 applies) | `FATAL[C2-stream-force]: matched 0 file(s), expected 1`, exit 1 | ✅ exit 1 |
+| 7 | upgrade simulation — pre-patched by v3 payload, then full v4 | v3-patched pkg (v1+v2+v3 applied) | earlier stages A1/B1/B1v2/B3/A3b no-op, **C1 `1/1` + C2 `1/1` apply**, exit 0 | ✅ all earlier stages `already patched (no-op)` / 0 written, C1 `1/1` patched, C2 `1/1` patched, exit 0; C1 + C2 markers confirmed present on the open-sse chunk; `node --check` OK |
+
+### 10.6 Anchor-count re-verification log (pristine, verbatim commands)
+
+```
+$ grep -c 'return n?!n.has(r):!r.endswith("-free")&&!E.has(r)}' open-sse_14vc3e4._.js
+1
+$ grep -c 'return b(i)&&(0,c.forgetAttempt)(i),{body:e,attempt:null};' open-sse_14vc3e4._.js
+1
+$ grep -rl '<C1 anchor>' dist/.build/next/server/chunks | wc -l   # uniqueness across root
+1
+$ grep -rl '<C2 anchor>' dist/.build/next/server/chunks | wc -l
+1
+```
+
+(Per the task rule: STOP before writing if any anchor count != expectations on pristine. Counts
+were exactly 1 for both anchors in both the target file and the cross-tree scan, so the writes
+proceeded.)
+
+### 10.7 Files touched by v4
+
+C1 and C2 splice into `dist/.build/next/server/chunks/open-sse_14vc3e4._.js` — the **same** file
+that B1/B1v2/B3 already edit. Total distinct files changed by the full v4 payload remains **6**
+(the 3 A1 set-member chunks + the open-sse chunk + the 2 A3b registry chunks). See §10.4.
+
+### 10.8 Do not use built-in web search
+
+This section, like §8, directs the implementer to use the omniroute tools only:
+`omniroute_search_web`, `omniroute_fetch_page`, `omniroute_fetch_full`,
+`omniroute_rerank_documents`, `omniroute_semantic_rank`.

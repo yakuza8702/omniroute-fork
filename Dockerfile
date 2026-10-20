@@ -241,6 +241,52 @@ if (on(process.env.PATCH_WORKBUDDY_UA)) {
   console.log("[A3b] skipped (PATCH_WORKBUDDY_UA=off)");
 }
 
+// ── C1 (v4): free-suffix premium rule — `-free` suffix / static E id ⇒ always free ──
+// Root cause (premium-set branch): `isPremiumOpencodeModel(e,t)` answers from the SYNCED
+// family free-set first — compiled `function p(e,t){if("opencode-go"===t)return!0;let r=e.trim(),
+// n=<synced-family-set build>;return n?!n.has(r):!r.endsWith("-free")&&!E.has(r)}` where E is the
+// static set ["big-pickle","deepseek-v4.1-flash-free","mimo-v2.5-free","hy3-free",
+// "nemotron-3-ultra-free","north-mini-code-free"]. When the family set `n` is non-null the legacy
+// `-free` test is bypassed entirely, so an id the gateway advertises as free is classified premium
+// until the synced set picks it up → the keyless lane answers 402 premium_model_requires_key for a
+// genuinely free model. v4 pins the rule AHEAD of the family branch: an id ending in `-free`, or one
+// of the six static E ids, is always free regardless of the family set; unknown non-suffixed ids
+// stay premium (the original family/legacy fallback is preserved verbatim after the injected guard).
+// Runs in the same PATCH_OPENCODE_ANON guard (the Goal-B toggle) as B1/B1v2/B3/C2.
+if (on(process.env.PATCH_OPENCODE_ANON)) {
+  patch({
+    id: "C1-free-suffix",
+    root: path.join(NEXT, "server", "chunks"),
+    search: 'return n?!n.has(r):!r.endsWith("-free")&&!E.has(r)}',
+    replace: 'return r.endsWith("-free")||E.has(r)?false:n?!n.has(r):!r.endsWith("-free")&&!E.has(r)}',
+    after: 'return r.endsWith("-free")||E.has(r)?false:n?!n.has(r):!r.endsWith("-free")&&!E.has(r)}',
+    expectFiles: 1,
+  });
+
+  // ── C2 (v4): force byte-streaming on the gated free-tier request ───────────────────
+  // Root cause (non-stream contract): the gated free-tier lane is streamed-only, and upstream's
+  // body contract (applyFreeTierRequestContract → `{...record, stream:true}`) switches off with
+  // OPENCODE_FREE_TIER_REQUEST_CONTRACT=off, while the executor's own `(t||l)&&(i.Accept=
+  // "text/event-stream")` is a header, not a body. A non-streaming body therefore reaches the
+  // gateway on the gated lane and is refused. v4 inserts `stream:true` + `stream_options.
+  // include_usage` immediately AFTER the gated early-return
+  //   `if(!f(r,n,o)||"off"===(process.env.OPENCODE_FREE_TIER_REQUEST_CONTRACT||"").trim().toLowerCase())
+  //     return b(i)&&(0,c.forgetAttempt)(i),{body:e,attempt:null};`
+  // so it runs ONLY on gated requests (the early-return already returned otherwise) and only when
+  // the body is a plain object. Same fail-closed/idempotent contract and PATCH_OPENCODE_ANON toggle.
+  patch({
+    id: "C2-stream-force",
+    root: path.join(NEXT, "server", "chunks"),
+    search: 'return b(i)&&(0,c.forgetAttempt)(i),{body:e,attempt:null};',
+    replace:
+      'return b(i)&&(0,c.forgetAttempt)(i),{body:e,attempt:null};if(e&&"object"==typeof e){e.stream=!0,e.stream_options={include_usage:!0}}',
+    after: 'e.stream=!0,e.stream_options={include_usage:!0}',
+    expectFiles: 1,
+  });
+} else {
+  console.log("[C1/C2] skipped (PATCH_OPENCODE_ANON=off)");
+}
+
 // ── A1 residual check: the same set is NOT allowed to leak into TOKEN_PASTE ───────
 const modal = walk(NEXT).filter((f) => fs.readFileSync(f, "utf8").includes('"muse-code","workbuddy"'));
 if (on(process.env.PATCH_WORKBUDDY_OAUTH) && modal.length !== 3) {
