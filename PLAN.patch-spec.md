@@ -643,3 +643,115 @@ The script touches **only** files under `/usr/local/lib/node_modules/omniroute/d
 | certified source anchors | HEAD `e9cb075c` at `/workspace/omniroute/_up/OmniRoute` |
 
 Do not use built-in web search. Use omniroute tools only (omniroute_search_web, omniroute_fetch_page, omniroute_fetch_full, omniroute_rerank_documents, omniroute_semantic_rank).
+
+---
+
+## 8. Patch v2 (anonymous-key override)
+
+**Motivation.** B1's v1 insertion `a||!l||(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||void 0);`
+only assigns the anonymous key when the effective credential `a` is *empty*. A gated free-tier
+request that already carries an api key leaves `a` truthy, so the `||!l||` clause short-circuits
+and the real key is sent upstream → 403. v2 overrides `a` with `OPENCODE_ANONYMOUS_KEY` on every
+gated request (`l`) whenever the env is set; ungated / unset-env behaviour is byte-identical to the
+pristine package.
+
+**Stage placement.** Inserted as a new `patch()` call inside the existing `if (on(process.env.PATCH_OPENCODE_ANON))`
+block, immediately after the B1 stage and before B3 — so `PATCH_OPENCODE_ANON=0` skips B1v2 together
+with B1/B3 (no separate toggle, no `ARG` change). B1/B3, the A1 stages, the version gate, the
+integrity residual checks, and the trailing `chown` are untouched.
+
+**Correction (per ACCEPTANCE FIXES).** The originally shipped v2 replacement terminated with a stray
+`}` (`...||a);}`) to match the literal spec string. In the minified `buildHeaders(e,t=!0,r,n,o,s){…}`
+method that `}` is NOT the method-close (the method closes once at the trailing `;return …,i}`) —
+injecting it mid-statement prematurely closes `buildHeaders`, orphaning the trailing `;a&&(…)` and
+failing `node --check` with `SyntaxError: Unexpected token '&&'` on `open-sse_14vc3e4._.js`. This
+was corrected in-place: the **deployed** replacement is now the brace-less form, which `node --check`s
+`OK` and preserves the identical runtime override (a stray closing brace at statement position has
+no semantic effect on a module-loaded chunk). The correction is intentional, not speculative.
+
+**Anchor / replacement / marker (exact, DEPLOYED):**
+
+```
+ANCHOR (v1-inserted, count==1 asserted):   a||!l||(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||void 0);
+REPLACEMENT (DEPLOYED, brace-less):        l&&(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||a);
+MARKER (idempotency, == replacement):       l&&(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||a);
+```
+
+**Sequencing semantics.** v2's `search` anchor is the string B1 just *inserted*, so v2 can only
+match after v1 has run in the same `RUN`. The dry-run confirms this ordering is what the single
+heredoc `RUN` delivers: pristine input → B1 writes, then B1v2 sees B1's output and writes.
+
+**Idempotency (ran-into-rerun hazard).** On a second run B1's pristine `after` (`a||!l||(a=...`)
+no longer exists in the chunk (v2 overwrote it), so B1 would otherwise scan, match 0, and `FATAL`.
+B1's `after` is widened to the common substring `(process.env.OPENCODE_ANONYMOUS_KEY` — present in
+both the v1-inserted and v2-rewritten forms — so the rerun reports B1 as "already patched (no-op)"
+instead of aborting. The `search` (the real anchor) and `replace`/`expectFiles` of B1 are unchanged,
+so first-run/v1-only behaviour is byte-identical to the existing stage. The patcher script itself
+still `node --check`s clean.
+
+**v2 dry-run (full v1+v2 payload against a fresh copy of `omniroute@3.8.52`):**
+
+| Case | Input | Expected | Result |
+| --- | --- | --- | --- |
+| 1 (fresh) | pristine | v1 applies (3+1+1) then v2 applies (1), B3 applies (1) | A1 `3 matched / 3 written`, B1 `1/1`, **B1v2 `1/1`**, B3 `1/1`, `exit 0` |
+| 2 (rerun) | post-full-patch | all no-op | `already patched (no-op)` ×5, 0 written, `exit 0` |
+| 3 (toggle off) | pristine, `PATCH_WORKBUDDY_OAUTH=0 PATCH_OPENCODE_ANON=0` | B1/B1v2/B3 skipped, A1 skipped | `[A1] skipped`, `[B1/B3] skipped`, `exit 0` |
+| 4 (node --check, patched chunks) | post-full-patch | valid syntax | all touched chunks: **OK** ×3 (A1) + `open-sse_14vc3e4._.js` **OK** (brace-less form) |
+| 5 (version gate) | `VERSION=3.8.53` | version mismatch | `FATAL: installed package version 3.8.52 != VERSION 3.8.53`, `exit 1` |
+| v2-only on pristine | pristine, v2 stage alone | v1 anchor absent | `FATAL[B1v2-anon-override]: matched 0 file(s), expected 1`, `exit 1` ✓ (fail-closed) |
+
+## 9. Patch v3 (WorkBuddy model-discovery user agent) — WIRED (expectFiles:2 paired edit)
+
+**Resolved:** the v3 stop condition (§9 as previously STOPPED) was resolved by accepting the
+two-live-chunks reality as a **paired edit** with `expectFiles: 2` plus a strict per-file guard.
+
+**Fork UA source (ground truth — exact values inlined, no dynamic composition):**
+- `src/lib/workbuddy/types.ts:77`  `export const WORKBUDDY_CLIENT_USER_AGENT = "CLI/2.63.2 CodeBuddy/2.63.2";`
+- `src/lib/workbuddy/types.ts:86`  `export const WORKBUDDY_DESKTOP_USER_AGENT = "WorkBuddy/5.5.2";`
+- `src/lib/workbuddy/upstream.ts:531-554` `workBuddyCatalogHeaders()` selects
+  `WORKBUDDY_DESKTOP_USER_AGENT` for the global edition (the edition that reads
+  `https://www.workbuddy.ai/v3/config`) and `WORKBUDDY_CLIENT_USER_AGENT` for the domestic edition.
+  The global-edition UA (`WorkBuddy/5.5.2`) is the one inlined into the compiled registry entry.
+
+**Target files (two, both live):**
+```
+dist/.build/next/server/chunks/_1frhb2o._.js   (imported by app/api/providers/[id]/models/route.js)
+dist/.build/next/server/chunks/_1zyjnzr._.js   (imported by app/api/providers/[id]/sync-models/route.js)
+```
+The workbuddy discovery config object is byte-identical in both (the only minified-identifier
+difference is the helper namespace `T` vs `v` *after* the injection point), so the anchor appears
+once per file → cross-tree total == 2, per-file == 1.
+
+**Anchor / replacement / marker (exact):**
+
+```
+ANCHOR (count==1 per file, total==2 asserted): "Content-Type":"application/json","X-Product":"SaaS"}
+REPLACEMENT:                                   "Content-Type":"application/json","user-agent":"WorkBuddy/5.5.2","X-Product":"SaaS"}
+MARKER:                                         "user-agent":"WorkBuddy/5.5.2"
+```
+
+**Stage semantics (custom loop, not the generic `patch()`):**
+- Toggle: `PATCH_WORKBUDDY_UA=1` (new `ARG` + `ENV`, added to the Insertion 1 block at Dockerfile:46-50).
+- Independence: v3's anchor exists on the pristine package (it is not produced by v1/v2), so v3
+  sequencing is independent of the B1/B1v2 ordering — it applies cleanly on pristine in the same `RUN`.
+- Idempotency: marker present in a file → `already patched (no-op)` for that file.
+- Fail-closed: total matched != 2 → `FATAL[A3b-workbuddy-ua]: matched N file(s), expected 2`.
+  Per-file anchor count != 1 → `FATAL … anchor occurs Nx`.
+  **Partial state** (marker in one file + anchor in the other) → `FATAL[A3b-workbuddy-ua]:
+  partial patch state detected` → `exit 1` (all-or-nothing; an out-of-band half-patch is rejected).
+  Neither marker nor anchor in both files (pristine) → applies; both already-patched → no-op.
+
+**v3 dry-run (full v1+v2+v3 payload, fresh copy of `omniroute@3.8.52`):**
+
+| Case | Input | Expected | Result |
+| --- | --- | --- | --- |
+| 1 (fresh) | pristine | A1 3/3, B1 1/1, B1v2 1/1, B3 1/1, A3b 2/2 | all `patched`, `exit 0`, **6 distinct files** touched |
+| 2 (rerun) | post-full-patch | all no-op | `already patched (no-op)` ×6, `exit 0` |
+| 3 (toggle off) | all `PATCH_*=0` | all skipped | `[A1] skipped`, `[B1/B3] skipped`, `[A3b] skipped`, `exit 0` |
+| 4 (node --check, all 6 files) | post-full-patch | valid syntax | `38v-rzudg0f4t.js`, `src_0lfns24._.js`, `src_1j6-c_9._.js`, `open-sse_14vc3e4._.js`, `_1frhb2o._.js`, `_1zyjnzr._.js` → all **OK** ×6 |
+| 5 (version gate) | `VERSION=3.8.53` | version mismatch | `FATAL: installed package version 3.8.52 != VERSION 3.8.53`, `exit 1` |
+| v3-partial state | post v1+v2, marker in `_1frhb2o` + anchor in `_1zyjnzr` | fail-closed | `FATAL[A3b-workbuddy-ua]: partial patch state detected — 1 already-patched + 1 todo`, `exit 1` ✓ |
+
+`PATCH_WORKBUDDY_UA` is added to the Insertion 1 `ARG`/`ENV` block (Dockerfile:46-50) alongside
+`PATCH_WORKBUDDY_OAUTH` and `PATCH_OPENCODE_ANON`, defaulting `1` and carried into the image `ENV`
+so the toggle is observable at runtime like the others.

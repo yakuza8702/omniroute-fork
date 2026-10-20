@@ -45,8 +45,10 @@ ENV OMNIROUTE_BIN=${OMNIROUTE_BIN}
 # fail-closed (a missing or ambiguous anchor aborts the build) and idempotent.
 ARG PATCH_WORKBUDDY_OAUTH=1
 ARG PATCH_OPENCODE_ANON=1
+ARG PATCH_WORKBUDDY_UA=1
 ENV PATCH_WORKBUDDY_OAUTH=${PATCH_WORKBUDDY_OAUTH} \
-    PATCH_OPENCODE_ANON=${PATCH_OPENCODE_ANON}
+    PATCH_OPENCODE_ANON=${PATCH_OPENCODE_ANON} \
+    PATCH_WORKBUDDY_UA=${PATCH_WORKBUDDY_UA}
 
 # Install the prebuilt server package from the public npm registry.
 # `--omit=dev` is best-effort: global installs normally resolve prod deps only anyway.
@@ -143,7 +145,30 @@ if (on(process.env.PATCH_OPENCODE_ANON)) {
     search: ',this.provider,n);a&&("claude"===this._requestFormat||this.usesZenApiKeyAuth()',
     replace:
       ',this.provider,n);a||!l||(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||void 0);a&&("claude"===this._requestFormat||this.usesZenApiKeyAuth()',
-    after: 'a||!l||(a=(process.env.OPENCODE_ANONYMOUS_KEY',
+    after: '(process.env.OPENCODE_ANONYMOUS_KEY',
+    expectFiles: 1,
+  });
+
+  // ── B1v2: anonymous key override for gated free-tier requests that still carry a credential ──
+  // v1 (B1 above) only fills `a` when it is empty (`a||!l||`); a gated request that already carries
+  // an api key therefore still sends that key and still 403s. v2 overrides `a` with
+  // OPENCODE_ANONYMOUS_KEY on every gated request (`l`) when the env is set, while ungated / unset-env
+  // behaviour is byte-identical to the pristine package. Runs in the same PATCH_OPENCODE_ANON guard
+  // as B1/B3 and is skipped together with them when PATCH_OPENCODE_ANON=0.
+  //
+  // ANCHOR (v1-inserted, asserted count==1 by the post-condition scan):
+  //   'a||!l||(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||void 0);'
+  // REPLACEMENT (syntax-correct; trailing method-closing brace omitted so the minified
+  // `buildHeaders(...) {...}` stays a single balanced method — verified `node --check`):
+  //   'l&&(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||a);'
+  // Idempotency marker = the v2 replace string (per-file count asserted == 1).
+  // If the v1 anchor is absent AND the v2 marker is absent → FATAL (matched 0 file(s), expected 1).
+  patch({
+    id: "B1v2-anon-override",
+    root: path.join(NEXT, "server", "chunks"),
+    search: 'a||!l||(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||void 0);',
+    replace: 'l&&(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||a);',
+    after: 'l&&(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||a);',
     expectFiles: 1,
   });
 
@@ -159,6 +184,61 @@ if (on(process.env.PATCH_OPENCODE_ANON)) {
   });
 } else {
   console.log("[B1/B3] skipped (PATCH_OPENCODE_ANON=off)");
+}
+
+// ── A3b: WorkBuddy model-discovery user agent (2 compiled copies, paired edit) ─────
+// The global WorkBuddy /v3/config catalogue read must be issued as the desktop client (its
+// CLI channel serves a different roster). Upstream omits a `user-agent` on the discovery entry;
+// the fork injects the desktop UA. The anchor is byte-identical in BOTH live registry chunks
+// (_1frhb2o._.js for /models, _1zyjnzr._.js for /sync-models), so expectFiles:2 with a strict
+// per-file guard (==1 occurrence in each, total ==2). Skipped when PATCH_WORKBUDDY_UA=0.
+if (on(process.env.PATCH_WORKBUDDY_UA)) {
+  const UA_MARKER = '"user-agent":"WorkBuddy/5.5.2"';
+  const UA_ANCHOR = '"Content-Type":"application/json","X-Product":"SaaS"}';
+  const UA_REPL   = '"Content-Type":"application/json","user-agent":"WorkBuddy/5.5.2","X-Product":"SaaS"}';
+  const uaRoot = path.join(NEXT, "server", "chunks");
+  const uaHits = [];
+  for (const file of walk(uaRoot)) {
+    const text = fs.readFileSync(file, "utf8");
+    const hasAnchor = text.split(UA_ANCHOR).length - 1;
+    const hasMarker = text.includes(UA_MARKER);
+    if (hasMarker) { uaHits.push({ file, state: "already" }); continue; }
+    if (hasAnchor === 0) continue;
+    if (hasAnchor !== 1) {
+      console.error(`FATAL[A3b-workbuddy-ua]: anchor occurs ${hasAnchor}x in ${file} (must be 1)`);
+      process.exit(1);
+    }
+    uaHits.push({ file, text, state: "todo" });
+  }
+  if (uaHits.length !== 2) {
+    console.error(`FATAL[A3b-workbuddy-ua]: matched ${uaHits.length} file(s), expected 2`);
+    for (const h of uaHits) console.error(`  ${h.state} ${h.file}`);
+    process.exit(1);
+  }
+  // Fail-closed on a partial state: a mix of "already patched" + "todo" across the two files
+  // means one chunk was patched by hand/out-of-band. All-or-nothing only.
+  const uaTodo = uaHits.filter((h) => h.state === "todo");
+  const uaAlready = uaHits.filter((h) => h.state === "already");
+  if (uaTodo.length > 0 && uaAlready.length > 0) {
+    console.error(`FATAL[A3b-workbuddy-ua]: partial patch state detected — ${uaAlready.length} already-patched + ${uaTodo.length} todo`);
+    for (const h of uaHits) console.error(`  ${h.state} ${h.file}`);
+    process.exit(1);
+  }
+  let uaWritten = 0;
+  for (const h of uaHits) {
+    if (h.state === "already") { console.log(`[A3b] already patched (no-op): ${h.file}`); continue; }
+    const next = h.text.replace(UA_ANCHOR, UA_REPL);
+    if (!next.includes(UA_MARKER)) {
+      console.error(`FATAL[A3b-workbuddy-ua]: post-condition failed in ${h.file}`);
+      process.exit(1);
+    }
+    fs.writeFileSync(h.file, next);
+    uaWritten += 1;
+    console.log(`[A3b] patched: ${h.file}`);
+  }
+  console.log(`[A3b] ok — ${uaHits.length} file(s) matched, ${uaWritten} written`);
+} else {
+  console.log("[A3b] skipped (PATCH_WORKBUDDY_UA=off)");
 }
 
 // ── A1 residual check: the same set is NOT allowed to leak into TOKEN_PASTE ───────
