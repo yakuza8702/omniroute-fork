@@ -16,11 +16,13 @@ Citation convention: `path:lines` is relative to the overlay target (the upstrea
 | Fork source | Destination | Rebase notes |
 |---|---|---|
 | `src/lib/workbuddy/types.ts:1-333` | `src/lib/workbuddy/types.ts` | **Rewritten, not copied.** One edition (`WORKBUDDY_EDITIONS` = the global entry, `providerId: "workbuddy"`, `configPath: "/v3/config"`, `catalogUserAgent: "WorkBuddy/5.5.2"`, `supportsCheckin: false`). The CN constants (`WORKBUDDY_CN_*`, `WORKBUDDY_MODELS_PATH`, check-in paths), `WorkBuddyCredential`/credits/check-in types and the region resolvers were dropped because nothing in this port uses them (single edition, no desktop import, no check-in) — they are listed under DEFERRED. Added the D9 gate `workBuddyAddonEnabled()` (server-only) and `isWorkBuddyProviderId()` (client-safe), per plan §A1. `WORKBUDDY_GLOBAL_PROVIDER_ID` is gone: `resolveWorkBuddyEdition` accepts `workbuddy`/`wb` only. |
-| `src/lib/workbuddy/upstream.ts:281-390` (parser cluster) | `src/lib/workbuddy/upstream.ts` | Trimmed to the **pure parsers**: `parseWorkBuddyCreditMultiplier`, `isSingularWorkBuddyEffortForm`, `parseWorkBuddyReasoning`, `parseWorkBuddyModel` (strict, unchanged semantics), plus the **new** `parseWorkBuddyModelLoose` (§A3/R8: keeps an entry whose token limits are absent, returns `contextLength`/`maxOutputTokens` = 0 and lets the caller omit the window). The I/O half of the fork file (envelope reads, fetch, credits, check-in, token refresh, `normalizeWorkBuddyReasoning`) is not part of wave 1 — the reasoning half lands in `0002` (plan §B1/B3) together with `normalizeWorkBuddyReasoning` (`fork upstream.ts:1021-1058`). |
+| `src/lib/workbuddy/upstream.ts:281-390` (parser cluster) | `src/lib/workbuddy/upstream.ts` | Trimmed to the **pure parsers**: `parseWorkBuddyCreditMultiplier`, `isSingularWorkBuddyEffortForm`, `parseWorkBuddyReasoning`, `parseWorkBuddyModel` (strict, unchanged semantics), plus the **new** `parseWorkBuddyModelLoose` (§A3/R8: keeps an entry whose token limits are absent, returns `contextLength`/`maxOutputTokens` = 0 and lets the caller omit the window). The I/O half of the fork file (envelope reads, fetch, credits, check-in, token refresh) is still not ported. **Wave 2 appended the reasoning half to this same copied file**: `WORKBUDDY_THINKING_LADDER` / `WorkBuddyEffortLevel` / `WorkBuddyReasoningContract`, `canonicalEffortWord`, `declaredEffortLadder`, `requestedThinking`, `clampToLadder` and `normalizeWorkBuddyReasoning` — a line-for-line port of `fork upstream.ts:890-1058` including the `ultra`/`maximum`→`max`, `minimum`→`minimal` and `off`/`disabled`/`false`→`none` canonicalizations, because an effort override is validated against the wider vocabulary (`shared/reasoning/reasoningEffortsOverride.ts` adds `ultra`). Still pure: no I/O, no env, no DB. |
 | `src/lib/workbuddy/addonInfo.ts:1-259` | `src/lib/workbuddy/addonInfo.ts` | **Minimal** description of the shipped surface only (catalogue, credits, chat, this description). Dropped: the CN/`workbuddy-global` provider rows, the desktop credential-source scan, the check-in capability and the two-edition guarantees — advertising a capability the addon refuses to perform is worse than saying nothing. `WORKBUDDY_ADDON_PROVIDER_IDS` now has just `{ global }`. |
 | — | `tests/unit/workbuddy-normalizer.test.ts` | New (plan §9 T2). |
 | — | `tests/unit/workbuddy-managed-import.test.ts` | New (plan §9 T3). |
 | — | `tests/unit/workbuddy-synced-credit.test.ts` | New (plan §9 T4). |
+| `src/lib/workbuddy/modelDiscovery.ts:27-40,142-146` (identity + invalidation only) | `src/lib/workbuddy/modelDiscovery.ts` | **Resolved in wave 2, minimal by design.** Wave 1 did not add the fork's discovery adapter (the mapping half is DEFERRED to wave 3 — upstream's generic discovery entry already fetches and persists, plan §D2). What B5 needs from that module is the pair the sync route calls after a write, so this file carries exactly `providerToWorkBuddyProviderId()` (single edition: `workbuddy`/`wb` → `workbuddy`, everything else `null`; no `workbuddy-global` branch) and `invalidateWorkBuddyModelCaches()` (lazy `import()` of the executor's cache reset, fork `modelDiscovery.ts:142-146`, fail-open). `workBuddyModelsToSyncedInput` / `fetchWorkBuddySyncModels` / `workBuddyModelPriceTier` are **not** here — wave 3 (§C3). |
+| — | `tests/unit/workbuddy-reasoning.test.ts` | New (plan §9 T5). Twelve cases: the pure ladder rule (strip / clamp up / off→`none` / off→floor / unknown word / `thinking` never forwarded), the override-first contract (B2, incl. the bulk-map path and connection-scoped row precedence), the single-edition id mapping, and B3/B4 wiring (both map keys resolve to `WorkBuddyExecutor`; the wire body is clamped end-to-end; the D9 gate leaves the body untouched). |
 
 Tests live under `addon/files/tests/unit/` on purpose: `overlay.sh` copies them into the
 checkout's `tests/unit/`, which is the only location the repo's harness globs
@@ -39,7 +41,23 @@ compiled or run.
 | `src/app/(dashboard)/dashboard/providers/[id]/hooks/useModelImportHandlers.ts:284-296` | The manual "add custom model" POST body forwards the raw discovery window (`context_length` → `max_input_tokens`) and `max_output_tokens`. | plan §A7 |
 | `tests/unit/workbuddy-provider.test.ts:386-417` | The "real catalogue entry, fields and all" pin asserted the OLD id/name/owned_by-only projection; it now asserts the enriched record. Every other assertion in that file reads single fields, so it was already enrichment-tolerant. | consequence of §A3 |
 
+## Modified files (`addon/patches/0002-workbuddy-reasoning.patch` — wave 2, Feature B)
+
+| Upstream anchor | Change | Fork origin |
+|---|---|---|
+| — (new file) | `open-sse/executors/workbuddyReasoning.ts` — the contract resolver: `resolveWorkBuddyReasoningContract({provider, model, connectionId, bulkEffortOverrides?})`, the 15 s per-provider row cache and `resetWorkBuddyReasoningContractCache()`. Reads the synced rows through `getSyncedAvailableModelsByConnection` and maps provider → synced ids **collapsed to the single `workbuddy` id** (D1: no `workbuddy-global` branch, no `cn`/`global` words). | fork `open-sse/executors/workbuddyReasoning.ts:1-157`; plan §B1 |
+| — (new file) | **B2 override-first**: before any row lookup, `getReasoningEffortsOverride(provider, modelId, bulk)` (`src/lib/db/modelCapabilityOverrides.ts:132-153`) is consulted for every candidate model id (the request id, its `/`-leaf, and the base id with a `-<tier>` suffix stripped) and a non-empty result short-circuits to `{ supportedEfforts: [...override] }`. The optional `bulkEffortOverrides` parameter takes the pre-loaded snapshot map so the capability path adds no query; on the null-bulk path the helper does the same direct SQL read `modelCapabilities.ts:1021-1024` uses. `set`/`remove` already invalidate the `"model-capabilities"` cache (`:182`/`:199`), and because the override is read **before** the cached rows it is visible on the very next request — no TTL wait. | plan §B2/D6 |
+| — (new file) | `open-sse/executors/workbuddy.ts` — thin `WorkBuddyExecutor extends DefaultExecutor`, overriding only `transformRequest`: `super.transformRequest(...)`, then the D9 gate `workBuddyAddonEnabled()`, then `normalizeWorkBuddyReasoning(out, contract)`. Nothing else is ported: no headers, no URL selection, no failure classification, no fallback stack (D5). | fork `open-sse/executors/workbuddy.ts` (transport half **not** ported); plan §B3 |
+| `open-sse/executors/index.ts:169-171` | Two lazy keys added in map order next to the CodeBuddy family: `workbuddy: () => import("./workbuddy.ts").then((m) => new m.WorkBuddyExecutor())` and `wb: …` (alias). `getExecutor` already falls back to `DefaultExecutor`, so nothing else changes. | plan §B4 |
+| `src/app/api/providers/[id]/sync-models/route.ts:24-31, 641-656` | After `await importManagedModels(...)` and guarded by `providerToWorkBuddyProviderId(logProvider)`, `await invalidateWorkBuddyModelCaches()`. The 15 s ladder cache is dropped the moment the rows change, so a just-synced ladder is honoured immediately; other providers pay one string compare. The helper is fail-open. | fork `src/app/api/providers/[id]/sync-models/route.ts` (guarded form is the plan's §B5 wording); plan §B5 |
+| `tests/snapshots/executors/executor-map.json` (frozen golden) | `keyCount` 140 → 142, plus the two entries `{"className":"WorkBuddyExecutor","provider":"workbuddy","configSource":"workbuddy"}`; `sharedInstances` unchanged (each key keeps its own instance). Regenerated with `UPDATE_GOLDEN=1` against the overlaid tree, **not** hand-edited. | plan §B4; §9 matrix row for `executor-map-golden.test.ts` |
+| `src/lib/workbuddy/upstream.ts` (copied file, not a patch) | The reasoning half is appended to the wave-1 copy — see the "New files" row above. | fork `upstream.ts:890-1058` |
+| `addon/overlay.sh` (governance) | Twelve post-condition markers added for 0002 (executor class, ladder export, override read, cache reset, both map keys, sync-route call, golden snapshot, T5 file), so a patch that applies but stops short fails the build. | plan §2 ("assert every post-condition marker") |
+
 ### Deliberate deviations from the plan text (reported, not silent)
+
+**Wave 1:**
+
 
 1. **§A3 emits the window conditionally.** The plan's snippet writes
    `context_length: m.contextLength` unconditionally; with the loose parse that would publish
@@ -66,6 +84,44 @@ compiled or run.
    preview projection can show it) but the synced row keeps upstream's positive-only rule, so
    the row has no vision flag. Pinned in T2 so either side changing is visible.
 
+**Wave 2:**
+
+6. **The two new executor modules travel INSIDE `0002`, not in `addon/files/`.** Wave 1's rule is
+   "new files are copied verbatim, existing files are patched"; wave 2 states the deliverable as a
+   patch that *adds* `workbuddyReasoning.ts` and `workbuddy.ts`, so they are added-file diffs. The
+   split is deliberate and documented rather than accidental: `git apply --check` then covers them
+   too, so a re-run of the overlay fails closed on them as well (proved in the transcript), and the
+   B1–B5 surface is reviewable as one artifact.
+7. **The golden *test* file is unchanged; the golden *snapshot* is what moved.** The task text
+   describes `tests/unit/executor-map-golden.test.ts:36-49` as if it pinned the map literal. It does
+   read the literal — but it extracts the keys dynamically and compares against
+   `tests/snapshots/executors/executor-map.json` via `goldenSnapshot()`. Adding assertions there
+   would be an addon-specific assertion inside an upstream characterization lock, so the snapshot is
+   updated instead (regenerated, never hand-written), and the two new keys are additionally asserted
+   from the addon's own T5 file (`hasSpecializedExecutor("workbuddy"|"wb")`, instance per key).
+8. **Both map keys construct the class with the CANONICAL provider id.** `new m.WorkBuddyExecutor()`
+   defaults to `workbuddy` for the `wb` key as well, because the registry entry that supplies
+   `baseUrl`/`forceStream` and the synced-catalogue key the ladder is read from are both keyed by
+   `workbuddy`; an instance reporting `wb` would resolve neither. The alias key exists for routing,
+   not for a second provider identity. The golden snapshot records `provider: "workbuddy"` for both
+   keys, and T5 pins it.
+9. **`transformRequest` guards the non-object body.** The plan's snippet passes `out` straight to
+   `normalizeWorkBuddyReasoning`, which destructures it; on a string/array/`null` body that would
+   fabricate an object. One guard line returns such a body untouched (the method is typed
+   `unknown`), and the addon-off test exercises the same path.
+10. **B5's import resolved to a NEW minimal `lib/workbuddy/modelDiscovery.ts`.** 0001 did not add the
+    fork's discovery adapter (it is DEFERRED to wave 3), so there was no existing file to extend.
+    The new module carries only the provider-id mapping and the lazy invalidation call — no discovery
+    mapping, no upstream fetch (§C3 owns those).
+11. **`Dockerfile.source` needed no migration copy.** Verified in the upstream tree rather than
+    assumed: `scripts/build/assembleStandalone.mjs:304` lists
+    `{ label: "migrations", src: ["src","lib","db","migrations"], dest: ["migrations"] }` in
+    `EXTRA_MODULE_ENTRIES`, and `Dockerfile:284-291` states the same ("migrations land at
+    <standalone>/migrations via assembleStandalone"). The runner stage already copies the whole
+    standalone tree and sets `OMNIROUTE_MIGRATIONS_DIR=/app/migrations`, so the runtime contract is
+    identical to the prebuilt image and no line was added. No deviation from the plan — the plan's
+    §7.2 sketch ("mount migrations from <standalone>/migrations") is what actually happens.
+
 ## DEFERRED (plan §12 — explicitly out of this port)
 
 * **CN edition + `workbuddy-global` provider id.** Needs a *new* id, not a rename: `workbuddy`
@@ -75,8 +131,14 @@ compiled or run.
   filesystem-reading; also the only consumer of the fork's `accounts.ts`, `credentials.ts` and
   the check-in paths.
 * **Fork executor failure classification + `accountFallback.ts` pool parking** (fork diff: 236
-  lines). Wave 1 ships no executor subclass at all; the thin `WorkBuddyExecutor` + the reasoning
-  ladder land in `0002` (plan §B1-B4).
+  lines). `0002` ships only the thin `WorkBuddyExecutor` (reasoning ladder on top of
+  `DefaultExecutor`); the fork's `execute()` override, its `workBuddyFailure` signal, the
+  cooldown/fallback-state modules and the `accountFallback.ts` parking stay out (plan §D5).
+* **The fork's discovery adapter mapping** (`workBuddyModelsToSyncedInput`,
+  `fetchWorkBuddySyncModels`, `workBuddyModelPriceTier`, the `credits` tier mapping). `0002` adds
+  only the identity + invalidation half of `lib/workbuddy/modelDiscovery.ts`; the mapping half
+  belongs to wave 3 (§C3) because upstream's generic discovery entry already persists the roster
+  (§D2).
 * **`prepareWorkBuddyChatBody`'s non-reasoning rules.** Upstream's registry entry already
   carries `forceStream`, `strictChatHistory` and `bodyStringReplacements`
   (`open-sse/config/providers/registry/workbuddy/index.ts`), so re-applying them would
@@ -85,9 +147,9 @@ compiled or run.
   the generic discovery entry already fetches and persists, and
   `opencodeFreeTierContract.ts` already sets `stream: true`.
 * **Not ported files (still listed for completeness):** fork `poolQuota.ts`, `poolState.ts`,
-  `freeModel.ts`, `modelDiscovery.ts` (the fork's own cache-invalidator — a different module
-  from upstream's `src/lib/providerModels/modelDiscovery.ts`) and the four workbuddy routes;
-  they belong to waves 3-4 (§C3/§C4).
+  `freeModel.ts`, `addonInfo.ts`'s credits/check-in surface, the mapping half of
+  `modelDiscovery.ts` (only its identity + cache-invalidation pair is ported, above) and the four
+  workbuddy routes; they belong to waves 3-4 (§C3/§C4).
 
 ## Provenance / rebase procedure
 
@@ -112,3 +174,20 @@ compiled or run.
 The typecheck used the dependency tree of the fork checkout (this repo has no `node_modules`),
 so it is a *scoped* typecheck, not the full `npm run typecheck:core` matrix. The full matrix runs
 in CI once the source image is built (plan §9 gates).
+
+## Verification performed for wave 2 (not a promise — the transcript is in the hand-off)
+
+| Check | Command | Result |
+|---|---|---|
+| Both patches apply | `bash addon/overlay.sh /workspace/pkgtest_scratch7` on a fresh pristine `3.8.53` copy (`rsync` + `git init`, `/workspace/pkgtest_scratch7`) | `overlay: applied 0001-workbuddy-enrichment.patch`, `overlay: applied 0002-workbuddy-reasoning.patch`, **24 post-condition assertions passed**, `overlay ok — 2 patch(es), 8 file(s)`, exit 0 |
+| Fail-closed | same command a second time | exit 1: `0001 … does not apply cleanly` (7 hunks), `0002 … does not apply cleanly` (both added files already exist + 3 hunks), `2 patch(es) failed git apply --check; nothing was applied` |
+| Unit tests (T5 + golden + wave-1 suite) | `node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts --test tests/unit/workbuddy-reasoning.test.ts tests/unit/workbuddy-{normalizer,managed-import,synced-credit,provider}.test.ts tests/unit/executor-map-golden.test.ts tests/unit/executor-registry.test.ts` in the overlaid tree | **63/63 pass**, exit 0 (T5 12, T2 7, T3 3, T4 6, pre-existing workbuddy 33, golden 2, registry 6) |
+| open-sse typecheck gate (CI-real) | `node scripts/check/check-open-sse-typecheck.mjs` | `openSseTypecheckErrors=0`, `OK — 0 pre-existing error(s), all within frozen baseline`, exit 0 |
+| Core typecheck gate | `npm run typecheck:core` | exit 0 |
+| Scoped project typecheck | `tsc -p tsconfig.wb-wave2.json` (new executor modules + touched route/modules + T5) | 13 diagnostics, **byte-identical to the pristine worktree baseline** with the pre-existing subset (`diff` of the two error sets is empty); none in an addon or touched file |
+| Addon modules under `strict` | `tsc -p tsconfig.wb-pure-strict.json` (`types`/`upstream`/`modelDiscovery`, `strict: true`), filtered to addon paths | no diagnostics in `src/lib/workbuddy/**` or `open-sse/executors/workbuddy*` |
+| Naming / gates | `grep -rn` of the overlaid tree | `workBuddyAddonEnabled()` has exactly one call site outside its definition: `open-sse/executors/workbuddy.ts:60` (the executor path). `workbuddy-global` has **no executable branch**: the only hits are prose comments, one `addonInfo.ts` disclaimer string, and the T5 assertion that the id maps to `null` |
+
+The 63-test run borrowed the fork checkout's `node_modules` via a symlink and pointed `TMPDIR` at
+the workspace disk, exactly as wave 1 did (`/workspace/.tmp_wave2`). No commit was made in this
+repository for wave 2.

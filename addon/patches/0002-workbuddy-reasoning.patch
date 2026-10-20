@@ -1,0 +1,356 @@
+diff --git a/open-sse/executors/index.ts b/open-sse/executors/index.ts
+index ec107eed..34713c95 100644
+--- a/open-sse/executors/index.ts
++++ b/open-sse/executors/index.ts
+@@ -169,6 +169,12 @@ const lazyExecutors: Record<string, () => Promise<BaseExecutor>> = {
+   cbcn: () => import("./codebuddy-cn.ts").then((m) => new m.CodeBuddyCnExecutor()), // Alias for codebuddy-cn
+   "codebuddy-intl": () => import("./codebuddy-intl.ts").then((m) => new m.CodeBuddyIntlExecutor()),
+   cbai: () => import("./codebuddy-intl.ts").then((m) => new m.CodeBuddyIntlExecutor()), // Alias for codebuddy-intl
++  // WorkBuddy (addon 0002 — PLAN.workbuddy-port.md §B4). Sibling of the CodeBuddy product
++  // family, kept next to it. The thin subclass adds ONLY the per-model reasoning ladder on
++  // top of DefaultExecutor (§B3); the registry entry already carries forceStream,
++  // strictChatHistory and the body repairs, so nothing here duplicates them.
++  workbuddy: () => import("./workbuddy.ts").then((m) => new m.WorkBuddyExecutor()),
++  wb: () => import("./workbuddy.ts").then((m) => new m.WorkBuddyExecutor()), // Alias for workbuddy
+   "zenmux-free": () => import("./zenmux-free.ts").then((m) => new m.ZenmuxFreeExecutor()),
+   "cloudflare-playground": () =>
+     import("./cloudflare-playground.ts").then((m) => new m.CloudflarePlaygroundExecutor()),
+diff --git a/open-sse/executors/workbuddy.ts b/open-sse/executors/workbuddy.ts
+new file mode 100644
+index 00000000..61d8be17
+--- /dev/null
++++ b/open-sse/executors/workbuddy.ts
+@@ -0,0 +1,74 @@
++/**
++ * WorkBuddy executor — `DefaultExecutor` plus the reasoning contract.
++ *
++ * Deliberately THIN (plan §B3/D5). The fork's executor is a 300-line class that also owns
++ * headers, URL selection, failure classification, account parking and the fallback stack;
++ * none of that is ported, because upstream 3.8.53 already ships the transport half:
++ *
++ *  - the registry entry (`open-sse/config/providers/registry/workbuddy/index.ts`) carries
++ *    `forceStream`, `strictChatHistory` and `bodyStringReplacements`;
++ *  - `DefaultExecutor.transformRequest` already runs the gateway's body rules for this
++ *    provider (`sanitizeWorkbuddyBody`: `max_completion_tokens` → `max_tokens`,
++ *    `developer` → `system`, leading system message, tool-choice flattening) and
++ *    `withWorkbuddyHeaders` attaches the attribution headers.
++ *
++ * Re-applying those rules here would double-shape the body — the one thing the fork's
++ * `prepareWorkBuddyChatBody` cannot express once the base class also runs. So this class
++ * adds exactly the rule the base class does NOT implement: the per-model reasoning ladder.
++ * `sanitizeWorkbuddyBody` never touches `reasoning_effort` / `thinking`, so the two layers
++ * compose instead of fighting.
++ *
++ * Both map keys (`workbuddy`, `wb`) construct the class with the CANONICAL provider id, so
++ * the registry entry that supplies `baseUrl` / `forceStream` and the synced-catalogue key
++ * the ladder is read from are always the canonical ones; the alias key exists for routing,
++ * not for a second provider identity. They are still two instances (the map's contract is
++ * "aliases never share an instance").
++ *
++ * @module open-sse/executors/workbuddy
++ */
++
++import { DefaultExecutor } from "./default.ts";
++import type { ProviderCredentials } from "./base.ts";
++import { WORKBUDDY_PROVIDER_ID, workBuddyAddonEnabled } from "@/lib/workbuddy/types";
++import { normalizeWorkBuddyReasoning } from "@/lib/workbuddy/upstream";
++import { resolveWorkBuddyReasoningContract } from "./workbuddyReasoning.ts";
++
++/**
++ * Reasoning shaping for one WorkBuddy request.
++ *
++ * Order is the base class first: `super.transformRequest` produces the body the transport
++ * would have sent anyway (including the gateway's own body rules), and the ladder is then
++ * applied on top of that exact body. Running the ladder first would let a later base rule
++ * resurrect a field it just deleted.
++ *
++ * The D9 gate (`WORKBUDDY_ADDON`, default on) is read here, per call, on the SERVER path
++ * only — a `"use client"` module must not import the gate (it reads `process.env`).
++ */
++export class WorkBuddyExecutor extends DefaultExecutor {
++  constructor(provider: string = WORKBUDDY_PROVIDER_ID) {
++    super(provider);
++  }
++
++  override async transformRequest(
++    model: string,
++    body: unknown,
++    stream: boolean,
++    credentials: ProviderCredentials
++  ): Promise<unknown> {
++    const out = await super.transformRequest(model, body, stream, credentials);
++
++    if (!workBuddyAddonEnabled()) return out;
++    // `transformRequest` is typed `unknown`; the ladder is a record transform, so anything
++    // else (a string body, an array, null) is passed through untouched rather than
++    // destructured into an object that only looks like a chat body.
++    if (!out || typeof out !== "object" || Array.isArray(out)) return out;
++
++    const contract = await resolveWorkBuddyReasoningContract({
++      provider: this.getProvider(),
++      model,
++      connectionId: credentials?.connectionId ?? null,
++    });
++
++    return normalizeWorkBuddyReasoning(out as Record<string, unknown>, contract);
++  }
++}
+diff --git a/open-sse/executors/workbuddyReasoning.ts b/open-sse/executors/workbuddyReasoning.ts
+new file mode 100644
+index 00000000..e50dc2c8
+--- /dev/null
++++ b/open-sse/executors/workbuddyReasoning.ts
+@@ -0,0 +1,193 @@
++/**
++ * WorkBuddy — resolve what the TARGET MODEL declares about thinking.
++ *
++ * The gateway rejects reasoning fields a model does not declare, so the request body has to
++ * be shaped per model, not per provider: `reasoning_effort` may only travel when the model's
++ * own declaration has a ladder, and even then only at a level inside it. Two sources can
++ * carry that declaration, and their precedence is deliberate:
++ *
++ *   1. a **persisted operator override** (`model_capability_overrides`, key
++ *      `reasoning_efforts`, written by the capability editor or
++ *      `PATCH /api/model-capability-overrides`) — the operator's explicit statement about
++ *      this target, so it wins for BOTH the catalog and the wire. Without this read the
++ *      editor would be cosmetic: the catalog would advertise `low,high` while the executor
++ *      still forwarded whatever the synced row allowed (plan §D6);
++ *   2. the **synced catalogue row** (`supportedThinkingEfforts`, written by discovery) —
++ *      there is no static registry row for discovered WorkBuddy models.
++ *
++ * Why a lookup module instead of a body-side guess: `normalizeWorkBuddyReasoning` is a pure
++ * function and must stay one. It takes the contract as an argument; this module is the only
++ * place that knows where the contract comes from, so the strip-vs-clamp rule stays testable
++ * without a database.
++ *
++ * Single edition (plan §D1): `workbuddy` is the global edition upstream and the alias `wb`
++ * collapses onto it. The fork's second id (`workbuddy-global`) has no branch here — a row
++ * stored under any other provider id is not this addon's declaration, so it declares
++ * nothing.
++ *
++ * Fail-open to "declares nothing" on every error: stripping a reasoning field costs a
++ * client a thinking budget, while forwarding one costs the whole request (400).
++ *
++ * @module open-sse/executors/workbuddyReasoning
++ */
++
++import { getSyncedAvailableModelsByConnection } from "@/lib/db/models";
++import { getReasoningEffortsOverride } from "@/lib/db/modelCapabilityOverrides";
++import { providerToWorkBuddyProviderId } from "@/lib/workbuddy/modelDiscovery";
++import {
++  WORKBUDDY_THINKING_LADDER,
++  type WorkBuddyReasoningContract,
++} from "@/lib/workbuddy/upstream";
++
++/** How long one provider's synced rows are reused before re-reading the store. */
++const CONTRACT_CACHE_TTL_MS = 15_000;
++
++/** The pre-loaded override map the capability snapshot already builds, when the caller holds one. */
++export type WorkBuddyEffortOverrideBulk = Parameters<typeof getReasoningEffortsOverride>[2];
++
++interface ReasoningRow {
++  id: string;
++  connectionId: string;
++  supportedThinkingEfforts?: string[];
++  supportsThinking?: boolean;
++}
++
++const rowCache = new Map<string, { at: number; rows: ReasoningRow[] }>();
++
++/**
++ * Provider id → the ids its synced catalogue is stored under.
++ *
++ * A request may arrive with the short alias (`wb`) the executor map also registers; both
++ * spellings read the ONE canonical catalogue. Any other id answers `[]`: no rows of another
++ * provider are ever consulted for this contract.
++ */
++function syncedProviderIds(provider: string): string[] {
++  const providerId = providerToWorkBuddyProviderId(provider);
++  return providerId ? [providerId] : [];
++}
++
++function rowsFor(byConnection: Record<string, unknown>): ReasoningRow[] {
++  const rows: ReasoningRow[] = [];
++  for (const [connectionId, models] of Object.entries(byConnection)) {
++    if (!Array.isArray(models)) continue;
++    for (const model of models) {
++      if (!model || typeof model !== "object") continue;
++      const record = model as Record<string, unknown>;
++      if (typeof record.id !== "string" || record.id === "") continue;
++      rows.push({
++        id: record.id,
++        connectionId,
++        ...(Array.isArray(record.supportedThinkingEfforts)
++          ? {
++              supportedThinkingEfforts: record.supportedThinkingEfforts.filter(
++                (entry): entry is string => typeof entry === "string" && entry !== ""
++              ),
++            }
++          : {}),
++        ...(typeof record.supportsThinking === "boolean"
++          ? { supportsThinking: record.supportsThinking }
++          : {}),
++      });
++    }
++  }
++  return rows;
++}
++
++async function loadRows(providerId: string): Promise<ReasoningRow[]> {
++  const cached = rowCache.get(providerId);
++  const now = Date.now();
++  if (cached && now - cached.at < CONTRACT_CACHE_TTL_MS) return cached.rows;
++  let rows: ReasoningRow[] = [];
++  try {
++    rows = rowsFor(await getSyncedAvailableModelsByConnection(providerId));
++  } catch {
++    // A store that cannot be read is not an error here: the caller falls back to
++    // "the model declares nothing", which is the safe body shape.
++    rows = [];
++  }
++  rowCache.set(providerId, { at: now, rows });
++  return rows;
++}
++
++/** The catalogue id a request's model id stands for (an effort suffix is not part of it). */
++function candidateModelIds(model: string): string[] {
++  const trimmed = (model ?? "").trim();
++  if (trimmed === "") return [];
++  const leaf = trimmed.includes("/") ? trimmed.slice(trimmed.lastIndexOf("/") + 1) : trimmed;
++  const ids = new Set<string>([trimmed, leaf]);
++  // A client may address `<model>-<tier>`: the declaration belongs to the base model.
++  for (const level of WORKBUDDY_THINKING_LADDER) {
++    const suffix = `-${level}`;
++    if (leaf.toLowerCase().endsWith(suffix)) {
++      ids.add(leaf.slice(0, leaf.length - suffix.length));
++    }
++  }
++  return [...ids].filter((id) => id !== "");
++}
++
++/**
++ * The reasoning contract for one request, or `undefined` when the model declares nothing.
++ *
++ * Order (binding, plan §B2): persisted override → the row synced for the REQUEST's own
++ * connection → any sibling connection's row for the same provider (two accounts can see
++ * different rosters).
++ */
++export async function resolveWorkBuddyReasoningContract(input: {
++  provider: string;
++  model: string;
++  connectionId?: string | null;
++  /** Optional pre-loaded `reasoning_efforts` override map (no extra query when supplied). */
++  bulkEffortOverrides?: WorkBuddyEffortOverrideBulk;
++}): Promise<WorkBuddyReasoningContract | undefined> {
++  const ids = candidateModelIds(input.model);
++  if (ids.length === 0) return undefined;
++
++  const providerIds = syncedProviderIds(input.provider);
++  if (providerIds.length === 0) return undefined;
++
++  for (const providerId of providerIds) {
++    for (const id of ids) {
++      // B2 — override-first. `getReasoningEffortsOverride` takes the BARE provider and model
++      // id (it joins them itself) and does a direct SQL read unless a bulk map is supplied,
++      // so this adds no query on the path that already has the capability snapshot.
++      const override = getReasoningEffortsOverride(
++        providerId,
++        id,
++        input.bulkEffortOverrides ?? null
++      );
++      if (override && override.length > 0) return { supportedEfforts: [...override] };
++    }
++  }
++
++  for (const providerId of providerIds) {
++    const rows = await loadRows(providerId);
++    if (rows.length === 0) continue;
++    const sameConnection = input.connectionId
++      ? rows.filter((row) => row.connectionId === input.connectionId)
++      : [];
++    for (const pool of [sameConnection, rows]) {
++      for (const id of ids) {
++        const row = pool.find((candidate) => candidate.id === id);
++        if (row) return contractFromRow(row);
++      }
++    }
++  }
++  return undefined;
++}
++
++function contractFromRow(row: ReasoningRow): WorkBuddyReasoningContract | undefined {
++  const supportedEfforts = row.supportedThinkingEfforts ?? [];
++  if (supportedEfforts.length === 0) return undefined;
++  return {
++    supportedEfforts,
++    // The synced row does not record the updater's `canDisableThinking` flag; a model that
++    // declares `none` in its own ladder is the one statement available, and
++    // `normalizeWorkBuddyReasoning` derives the same default when this is omitted.
++    ...(row.supportsThinking === false ? { canDisableThinking: false } : {}),
++  };
++}
++
++/** Drop the cached rows — tests and post-sync callers need a fresh read. */
++export function resetWorkBuddyReasoningContractCache(): void {
++  rowCache.clear();
++}
+diff --git a/src/app/api/providers/[id]/sync-models/route.ts b/src/app/api/providers/[id]/sync-models/route.ts
+index e783d118..4c246ddd 100644
+--- a/src/app/api/providers/[id]/sync-models/route.ts
++++ b/src/app/api/providers/[id]/sync-models/route.ts
+@@ -24,6 +24,10 @@ import { autoSyncCodexProfilesFromLiveCatalog } from "@/lib/cli-helper/codexProf
+ import { autoSyncClaudeProfilesFromLiveCatalog } from "@/lib/cli-helper/claudeProfileAutoSync";
+ import { getSearchProvider } from "@omniroute/open-sse/config/searchRegistry.ts";
+ import { providerUsesCuratedModelsOnly } from "@/lib/providers/modelListingCapability";
++import {
++  invalidateWorkBuddyModelCaches,
++  providerToWorkBuddyProviderId,
++} from "@/lib/workbuddy/modelDiscovery";
+ import {
+   fetchVolcPlanModels,
+   providerToVolcPlanKind,
+@@ -641,6 +645,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
+       previousSyncedAvailableModels: previousSyncedAvailableModelsForConnection,
+     });
+ 
++    // WorkBuddy addon 0002 (§B5): the rows just changed, but the request path reuses each
++    // provider's thinking ladder for 15 s. Drop it now, or a just-synced catalogue keeps
++    // rejecting (or accepting) `reasoning_effort` until the TTL expires. Guarded by the
++    // provider id, so every other provider pays a string compare and nothing else, and
++    // fail-open inside the helper (a sync that succeeded must not be failed by a cache).
++    if (providerToWorkBuddyProviderId(logProvider)) {
++      await invalidateWorkBuddyModelCaches();
++    }
++
+     const effectiveAvailableModels = resolveEffectiveAvailableModels(
+       freeFilterEmpty,
+       discoveredModels,
+diff --git a/tests/snapshots/executors/executor-map.json b/tests/snapshots/executors/executor-map.json
+index 01d64894..b9574701 100644
+--- a/tests/snapshots/executors/executor-map.json
++++ b/tests/snapshots/executors/executor-map.json
+@@ -640,6 +640,16 @@
+       "configSource": "vertex",
+       "provider": "vertex"
+     },
++    "wb": {
++      "className": "WorkBuddyExecutor",
++      "configSource": "workbuddy",
++      "provider": "workbuddy"
++    },
++    "workbuddy": {
++      "className": "WorkBuddyExecutor",
++      "configSource": "workbuddy",
++      "provider": "workbuddy"
++    },
+     "xai": {
+       "className": "XaiExecutor",
+       "configSource": "xai",
+@@ -701,6 +711,6 @@
+       "provider": "zai-web"
+     }
+   },
+-  "keyCount": 140,
++  "keyCount": 142,
+   "sharedInstances": []
+ }

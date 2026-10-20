@@ -88,6 +88,25 @@ const markers = [
   ["src/lib/db/models/synced.ts", "creditMultiplier !== undefined ? { creditMultiplier }"],
   ["src/app/api/providers/[id]/models/discovery/catalogModels.ts", "model.creditMultiplier"],
   ["src/app/(dashboard)/dashboard/providers/[id]/hooks/useModelImportHandlers.ts", "max_output_tokens"],
+  // 0002 — Feature B (reasoning contract). The executor path, its ladder cache, the two
+  // executor-map keys, the post-sync invalidation and the golden snapshot that freezes the
+  // map. A patch that applied but silently stopped short of any of these is a build failure,
+  // not a warning: the ladder is the difference between a working request and a 400.
+  ["src/lib/workbuddy/upstream.ts", "export function normalizeWorkBuddyReasoning("],
+  ["src/lib/workbuddy/modelDiscovery.ts", "export async function invalidateWorkBuddyModelCaches("],
+  [
+    "open-sse/executors/workbuddyReasoning.ts",
+    "export async function resolveWorkBuddyReasoningContract(",
+  ],
+  ["open-sse/executors/workbuddyReasoning.ts", "getReasoningEffortsOverride("],
+  ["open-sse/executors/workbuddyReasoning.ts", "export function resetWorkBuddyReasoningContractCache("],
+  ["open-sse/executors/workbuddy.ts", "export class WorkBuddyExecutor extends DefaultExecutor"],
+  ["open-sse/executors/workbuddy.ts", "normalizeWorkBuddyReasoning(out as Record<string, unknown>, contract)"],
+  ["open-sse/executors/index.ts", "workbuddy: () => import(\"./workbuddy.ts\")"],
+  ["open-sse/executors/index.ts", "wb: () => import(\"./workbuddy.ts\")"],
+  ["src/app/api/providers/[id]/sync-models/route.ts", "invalidateWorkBuddyModelCaches()"],
+  ["tests/snapshots/executors/executor-map.json", "\"WorkBuddyExecutor\""],
+  ["tests/unit/workbuddy-reasoning.test.ts", "override-first"],
 ];
 
 let missing = 0;
