@@ -40,6 +40,13 @@ ENV NPM_CONFIG_LEGACY_PEER_DEPS=true \
 # location so a plain `docker build` without the arg still works.
 ARG OMNIROUTE_BIN=/usr/local/bin/omniroute
 ENV OMNIROUTE_BIN=${OMNIROUTE_BIN}
+# ── fork-local patch toggles (default: patch ON, both fixes independently switchable) ──
+# Anchor edits are applied to the installed npm package's compiled chunks; they are
+# fail-closed (a missing or ambiguous anchor aborts the build) and idempotent.
+ARG PATCH_WORKBUDDY_OAUTH=1
+ARG PATCH_OPENCODE_ANON=1
+ENV PATCH_WORKBUDDY_OAUTH=${PATCH_WORKBUDDY_OAUTH} \
+    PATCH_OPENCODE_ANON=${PATCH_OPENCODE_ANON}
 
 # Install the prebuilt server package from the public npm registry.
 # `--omit=dev` is best-effort: global installs normally resolve prod deps only anyway.
@@ -48,10 +55,136 @@ RUN set -eux; \
     npm cache clean --force; \
     rm -rf /root/.npm /tmp/*
 
+# ── fork-local patches: literal anchor splices on the shipped compiled bundles ──────
+# Rationale: the runtime is dist/server.js + dist/.build/next (standalone), not src/**,
+# so a source-level edit inside the image would never load. Every anchor below was
+# extracted from the pinned tarball and is asserted unique (count == 1) before use.
+# A version bump that moves or duplicates an anchor FAILS THE BUILD here, by design.
+RUN node --input-type=module - <<'PATCH_EOF'
+import fs from "node:fs";
+import path from "node:path";
+
+const PKG = "/usr/local/lib/node_modules/omniroute";
+const version = JSON.parse(fs.readFileSync(path.join(PKG, "package.json"), "utf8")).version;
+const want = process.env.VERSION;
+if (want && version !== want) {
+  console.error(`FATAL: installed package version ${version} != VERSION ${want}`);
+  process.exit(1);
+}
+const on = (v) => !/^(0|false|no|off)$/i.test(String(v ?? "").trim());
+
+function walk(dir, out = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, entry.name);
+    if (entry.isDirectory()) walk(p, out);
+    else if (entry.isFile() && p.endsWith(".js")) out.push(p);
+  }
+  return out;
+}
+
+function patch({ id, root, search, replace, expectFiles, after }) {
+  if (!fs.existsSync(root)) {
+    console.error(`FATAL[${id}]: missing root ${root}`);
+    process.exit(1);
+  }
+  const hits = [];
+  for (const file of walk(root)) {
+    const text = fs.readFileSync(file, "utf8");
+    if (text.includes(after)) { hits.push({ file, text, state: "already" }); continue; }
+    const n = text.split(search).length - 1;
+    if (n === 0) continue;
+    if (n !== 1) {
+      console.error(`FATAL[${id}]: anchor occurs ${n}x (must be 1) in ${file}`);
+      process.exit(1);
+    }
+    hits.push({ file, text, state: "todo" });
+  }
+  if (hits.length !== expectFiles) {
+    console.error(`FATAL[${id}]: matched ${hits.length} file(s), expected ${expectFiles}`);
+    for (const h of hits) console.error(`  ${h.state} ${h.file}`);
+    process.exit(1);
+  }
+  let written = 0;
+  for (const h of hits) {
+    if (h.state === "already") { console.log(`[${id}] already patched (no-op): ${h.file}`); continue; }
+    const next = h.text.replace(search, replace);
+    if (!next.includes(after)) {
+      console.error(`FATAL[${id}]: post-condition failed in ${h.file}`);
+      process.exit(1);
+    }
+    fs.writeFileSync(h.file, next);
+    written += 1;
+    console.log(`[${id}] patched: ${h.file}`);
+  }
+  console.log(`[${id}] ok — ${hits.length} file(s) matched, ${written} written`);
+}
+
+const NEXT = path.join(PKG, "dist", ".build", "next");
+
+// ── A1: WorkBuddy in DEVICE_CODE_PROVIDERS (3 compiled copies) ────────────────────
+if (on(process.env.PATCH_WORKBUDDY_OAUTH)) {
+  patch({
+    id: "A1-workbuddy-device-code",
+    root: NEXT,
+    search: '"grok-cli","muse-code"])',
+    replace: '"grok-cli","muse-code","workbuddy"])',
+    after: '"muse-code","workbuddy"',
+    expectFiles: 3,
+  });
+} else {
+  console.log("[A1] skipped (PATCH_WORKBUDDY_OAUTH=off)");
+}
+
+// ── B1: keyless anonymous lane on the gated free-tier request (1 copy) ────────────
+if (on(process.env.PATCH_OPENCODE_ANON)) {
+  patch({
+    id: "B1-opencode-anonymous-key",
+    root: path.join(NEXT, "server", "chunks"),
+    search: ',this.provider,n);a&&("claude"===this._requestFormat||this.usesZenApiKeyAuth()',
+    replace:
+      ',this.provider,n);a||!l||(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||void 0);a&&("claude"===this._requestFormat||this.usesZenApiKeyAuth()',
+    after: 'a||!l||(a=(process.env.OPENCODE_ANONYMOUS_KEY',
+    expectFiles: 1,
+  });
+
+  // ── B3: free-tier dead-id blocklist (1 copy) ────────────────────────────────────
+  patch({
+    id: "B3-opencode-free-blocklist",
+    root: path.join(NEXT, "server", "chunks"),
+    search: '"deprecated"!==o&&t.add(r)}',
+    replace:
+      '"deprecated"!==o&&!new Set((process.env.OPENCODE_FREE_TIER_MODEL_BLOCKLIST||"").split(",").map(s=>s.trim()).filter(Boolean)).has(r)&&t.add(r)}',
+    after: "OPENCODE_FREE_TIER_MODEL_BLOCKLIST",
+    expectFiles: 1,
+  });
+} else {
+  console.log("[B1/B3] skipped (PATCH_OPENCODE_ANON=off)");
+}
+
+// ── A1 residual check: the same set is NOT allowed to leak into TOKEN_PASTE ───────
+const modal = walk(NEXT).filter((f) => fs.readFileSync(f, "utf8").includes('"muse-code","workbuddy"'));
+if (on(process.env.PATCH_WORKBUDDY_OAUTH) && modal.length !== 3) {
+  console.error(`FATAL: expected 3 workbuddy-carrying chunks, found ${modal.length}`);
+  process.exit(1);
+}
+
+// ── integrity: the two Goal-B edits must not have landed in a different copy ──────
+const b1 = walk(path.join(NEXT, "server", "chunks")).filter((f) =>
+  fs.readFileSync(f, "utf8").includes("process.env.OPENCODE_ANONYMOUS_KEY")
+);
+if (on(process.env.PATCH_OPENCODE_ANON) && b1.length !== 1) {
+  console.error(`FATAL: expected 1 anonymous-lane chunk, found ${b1.length}`);
+  process.exit(1);
+}
+
+console.log(`patched package omniroute@${version} under ${PKG}`);
+PATCH_EOF
+
+# Every patched file must still be owned by the runtime user (see the note at line 51-52).
+RUN chown -R node:node /usr/local/lib/node_modules/omniroute
+
 # The runtime user must own its own package tree: the CLI (and anything it writes back into
 # the install prefix, e.g. caches or self-heal paths) runs as `node`, not root.
-RUN set -eux; \
-    chown -R node:node /usr/local/lib/node_modules/omniroute
 
 # Runtime data dirs owned by the unprivileged `node` user (uid/gid 1000 in the official image).
 # NOTE (ASSUMPTION): /app/migrations is only created so OMNIROUTE_MIGRATIONS_DIR resolves; the
