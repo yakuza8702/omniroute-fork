@@ -1,0 +1,353 @@
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/hooks/useModelImportHandlers.ts b/src/app/(dashboard)/dashboard/providers/[id]/hooks/useModelImportHandlers.ts
+index 6278e2a0..b0abf520 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/hooks/useModelImportHandlers.ts
++++ b/src/app/(dashboard)/dashboard/providers/[id]/hooks/useModelImportHandlers.ts
+@@ -286,6 +286,16 @@ export function useModelImportHandlers({
+             ...(typeof model.inputTokenLimit === "number" && model.inputTokenLimit > 0
+               ? { max_input_tokens: model.inputTokenLimit }
+               : {}),
++            // Raw discovery records spell the window `context_length` / the output ceiling
++            // `max_output_tokens`; the add-model wire shape uses max_input_tokens /
++            // max_output_tokens (providerModelMutationSchema). Forwarding the raw shape
++            // here is what stops a manually imported row from losing its window.
++            ...(typeof model.context_length === "number" && model.context_length > 0
++              ? { max_input_tokens: model.context_length }
++              : {}),
++            ...(typeof model.max_output_tokens === "number" && model.max_output_tokens > 0
++              ? { max_output_tokens: model.max_output_tokens }
++              : {}),
+             ...(typeof model.targetFormat === "string" ? { targetFormat: model.targetFormat } : {}),
+           }),
+         });
+diff --git a/src/app/api/providers/[id]/models/discovery/catalogModels.ts b/src/app/api/providers/[id]/models/discovery/catalogModels.ts
+index 8c4a3e46..17466ebe 100644
+--- a/src/app/api/providers/[id]/models/discovery/catalogModels.ts
++++ b/src/app/api/providers/[id]/models/discovery/catalogModels.ts
+@@ -5,6 +5,13 @@ type CatalogModel = {
+   supportedEndpoints?: string[];
+   endpointCapabilitySource?: "declared" | "inferred" | "defaulted" | "operator";
+   supportsVision?: unknown;
++  /**
++   * Declared credit rate (WorkBuddy `credits` multiplier) and the free verdict derived from
++   * it. Both are on the synced row; without this projection the dashboard's preview cannot
++   * show a rate the row already stores.
++   */
++  creditMultiplier?: number;
++  isFree?: boolean;
+ };
+ 
+ /** Keep explicit false distinct from missing discovery capability metadata. */
+@@ -18,6 +25,10 @@ export function toDiscoveryCatalogModel(model: CatalogModel, ownedBy?: string) {
+       ? { endpointCapabilitySource: model.endpointCapabilitySource }
+       : {}),
+     ...(typeof model.supportsVision === "boolean" ? { supportsVision: model.supportsVision } : {}),
++    ...(typeof model.creditMultiplier === "number"
++      ? { creditMultiplier: model.creditMultiplier }
++      : {}),
++    ...(model.isFree === true ? { isFree: true } : {}),
+     ...(ownedBy ? { owned_by: ownedBy } : {}),
+   };
+ }
+diff --git a/src/app/api/providers/[id]/models/discovery/normalizers.ts b/src/app/api/providers/[id]/models/discovery/normalizers.ts
+index 20151dc0..b449c9ac 100644
+--- a/src/app/api/providers/[id]/models/discovery/normalizers.ts
++++ b/src/app/api/providers/[id]/models/discovery/normalizers.ts
+@@ -21,6 +21,8 @@ import {
+   isUsableAntigravityProjectId,
+ } from "@omniroute/open-sse/services/antigravityProjectBootstrap.ts";
+ import { persistDiscoveredAntigravityProjectId } from "@omniroute/open-sse/services/antigravityProjectPersist.ts";
++import { parseWorkBuddyModelLoose } from "@/lib/workbuddy/upstream";
++import type { WorkBuddyModel } from "@/lib/workbuddy/types";
+ import { asRecord, toNonEmptyString } from "./helpers";
+ 
+ const antigravityDiscoveryInflight = new Map<
+@@ -345,10 +347,17 @@ export function normalizeOpenAiLikeModelsResponse(
+  * of them, so the exclusion below guards the fallback path and any future
+  * payload that does list them, rather than repairing a live symptom. See
+  * `isWorkbuddyMediaModel`.
++ *
++ * The record emitted here is ENRICHED, not just id+name: the token windows, the
++ * vision/tool flags, the reasoning ladder and the declared credit rate all travel with the
++ * entry, because the discovery normalizer rebuilds every row field by field and anything
++ * absent here is gone by the time the catalog reads it. The parse is the LOOSE one
++ * (`parseWorkBuddyModelLoose`): an entry whose token limits are absent must not silently
++ * disappear from the roster, and a limit-less entry publishes no window so the catalog's
++ * existing fallback still applies. `parseWorkBuddyModel` stays authoritative for the
++ * credit / free-model paths, which do need a real window.
+  */
+-export function normalizeWorkbuddyModelsResponse(
+-  data: unknown
+-): Array<{ id: string; name: string; owned_by: string }> {
++export function normalizeWorkbuddyModelsResponse(data: unknown): WorkbuddyDiscoveryRecord[] {
+   const root = asRecord(data);
+   const inner = asRecord(root.data);
+   const payload = inner.models ?? root.models;
+@@ -359,16 +368,115 @@ export function normalizeWorkbuddyModelsResponse(
+       ? Object.entries(asRecord(payload)).map(([id, value]) => ({ id, ...asRecord(value) }))
+       : [];
+ 
+-  return items
+-    .map((value) => {
+-      const item = asRecord(value);
+-      const id = toNonEmptyString(item.id) || toNonEmptyString(item.model);
+-      if (!id) return null;
+-      if (isWorkbuddyMediaModel(item)) return null;
+-      const name = toNonEmptyString(item.name) || toNonEmptyString(item.displayName) || id;
+-      return { id, name, owned_by: "workbuddy" };
+-    })
+-    .filter((value): value is { id: string; name: string; owned_by: string } => Boolean(value));
++  const records: WorkbuddyDiscoveryRecord[] = [];
++  for (const value of items) {
++    const item = asRecord(value);
++    const id = toNonEmptyString(item.id) || toNonEmptyString(item.model);
++    if (!id) continue;
++    if (isWorkbuddyMediaModel(item)) continue;
++    const name = toNonEmptyString(item.name) || toNonEmptyString(item.displayName) || id;
++    records.push(toWorkbuddyDiscoveryRecord(item, id, name));
++  }
++  return records;
++}
++
++/**
++ * One enriched discovery record for a WorkBuddy catalogue entry.
++ *
++ * The field names are the discovery vocabulary the rest of the pipeline reads
++ * (`normalizeDiscoveredModels` -> synced row -> catalog -> runtime meta), not the addon's
++ * own camelCase model: `context_length` for the window, `max_output_tokens` for the output
++ * ceiling, `supportsTools`/`supportsVision` for the capability flags, the
++ * `supportedThinkingEfforts` ladder, and `creditMultiplier`/`isFree` for the economics.
++ * Without them a synced workbuddy row carries no window and the dashboard pays the 200k
++ * default it never measured.
++ */
++type WorkbuddyDiscoveryRecord = {
++  id: string;
++  name: string;
++  owned_by: string;
++  context_length?: number;
++  max_input_tokens?: number;
++  max_output_tokens?: number;
++  supportsVision?: boolean;
++  supportsTools?: boolean;
++  supportsThinking?: boolean;
++  supportedThinkingEfforts?: string[];
++  defaultThinkingEffort?: string;
++  creditMultiplier?: number;
++  isFree?: boolean;
++  description?: string;
++  /** Preview-only: the managed importer does not persist tags. */
++  tags?: string[];
++};
++
++/** The declared reasoning ladder, when the entry carries one worth advertising. */
++function workbuddyEffortLadder(model: WorkBuddyModel | undefined): string[] | undefined {
++  const efforts = model?.reasoning?.supportedEfforts;
++  if (!Array.isArray(efforts) || efforts.length === 0) return undefined;
++  return [...efforts];
++}
++
++/** Entry tags, strings only (the payload's `tags` is not contractual). */
++function workbuddyEntryTags(item: Record<string, unknown>): string[] | undefined {
++  if (!Array.isArray(item.tags)) return undefined;
++  const tags = item.tags.filter(
++    (tag): tag is string => typeof tag === "string" && tag.length > 0
++  );
++  return tags.length > 0 ? tags : undefined;
++}
++
++/**
++ * Description to publish: the upstream's English text first, its Chinese text as the
++ * fallback. Only text the upstream actually sent is ever used.
++ */
++function workbuddyDescription(model: WorkBuddyModel | undefined): string | undefined {
++  return model?.descriptionEn ?? model?.descriptionZh ?? undefined;
++}
++
++/**
++ * Build one enriched record from one catalogue entry.
++ *
++ * The token window is published ONLY when the upstream declared a positive one: a
++ * limit-less entry stays in the roster (that is the point of the loose parse) but carries
++ * no `context_length`/`max_output_tokens`, so the catalog's existing default-window
++ * fallback applies instead of a `0` window being written to the synced row.
++ */
++function toWorkbuddyDiscoveryRecord(
++  item: Record<string, unknown>,
++  id: string,
++  name: string
++): WorkbuddyDiscoveryRecord {
++  // The parser resolves the id itself; hand it the id the legacy mapper accepted (which
++  // tolerated `model` as the id field) so tolerant payload shapes keep working.
++  const model = parseWorkBuddyModelLoose({ ...item, id });
++  const ladder = workbuddyEffortLadder(model);
++  const description = workbuddyDescription(model);
++  const tags = workbuddyEntryTags(item);
++  const defaultThinkingEffort = model?.reasoning?.defaultEffort;
++  return {
++    id,
++    name,
++    owned_by: "workbuddy",
++    ...(model && model.contextLength > 0
++      ? { context_length: model.contextLength, max_input_tokens: model.contextLength }
++      : {}),
++    ...(model && model.maxOutputTokens > 0 ? { max_output_tokens: model.maxOutputTokens } : {}),
++    ...(model?.supportsVision === undefined ? {} : { supportsVision: model.supportsVision }),
++    ...(model?.supportsToolCall === undefined ? {} : { supportsTools: model.supportsToolCall }),
++    ...(ladder === undefined
++      ? {}
++      : {
++          supportsThinking: true,
++          supportedThinkingEfforts: ladder,
++          ...(defaultThinkingEffort === undefined ? {} : { defaultThinkingEffort }),
++        }),
++    ...(model?.creditMultiplier === undefined
++      ? {}
++      : { creditMultiplier: model.creditMultiplier, isFree: model.creditMultiplier === 0 }),
++    ...(description === undefined ? {} : { description }),
++    ...(tags === undefined ? {} : { tags }),
++  };
+ }
+ 
+ /**
+diff --git a/src/app/api/providers/[id]/models/discovery/providerModelsConfig.ts b/src/app/api/providers/[id]/models/discovery/providerModelsConfig.ts
+index f28cf6cf..37292a97 100644
+--- a/src/app/api/providers/[id]/models/discovery/providerModelsConfig.ts
++++ b/src/app/api/providers/[id]/models/discovery/providerModelsConfig.ts
+@@ -961,7 +961,14 @@ export const PROVIDER_MODELS_CONFIG: Record<string, ProviderModelsConfigEntry> =
+   workbuddy: {
+     url: "https://www.workbuddy.ai/v3/config",
+     method: "GET",
+-    headers: { "Content-Type": "application/json", "X-Product": "SaaS" },
++    // The product-config service selects the roster by client channel: the desktop UA is
++    // the one that lists the free x0.00 tier, the CLI UA omits it. One edition upstream,
++    // so one static value; a second edition would need a per-connection resolver.
++    headers: {
++      "Content-Type": "application/json",
++      "X-Product": "SaaS",
++      "user-agent": "WorkBuddy/5.5.2",
++    },
+     authHeader: "Authorization",
+     authPrefix: "Bearer ",
+     parseResponse: (data) => normalizeWorkbuddyModelsResponse(data),
+diff --git a/src/lib/db/models/synced.ts b/src/lib/db/models/synced.ts
+index 2e1d376e..d5cad2eb 100644
+--- a/src/lib/db/models/synced.ts
++++ b/src/lib/db/models/synced.ts
+@@ -36,6 +36,13 @@ export interface SyncedAvailableModel {
+   supportsVideo?: boolean;
+   /** Discovery economics verdict; false preserves explicit paid evidence. */
+   isFree?: boolean;
++  /**
++   * Declared credit rate of the model, when the discovery payload supplied one — WorkBuddy
++   * spells it as a `credits` multiplier (`"x0.03 credits"` → 0.03; `0` is the upstream's
++   * own "free"). Absent means the upstream declared no rate, which is NOT the same as
++   * free, and consumers must keep the two apart.
++   */
++  creditMultiplier?: number;
+   // #4264: image-input capability captured at sync time (e.g. OpenRouter
+   // `architecture.input_modalities`/`modality`) so the catalog can surface vision.
+   supportsVision?: boolean;
+@@ -69,6 +76,26 @@ function normalizeSyncedAvailableModel(model: unknown): SyncedAvailableModel | n
+       ).sort()
+     : undefined;
+ 
++  // The rate and the free bit are one claim. A valid rate survives and `isFree` is derived
++  // from it; a row that CLAIMS a rate which does not parse drops the claim instead of
++  // keeping `isFree: true` with no surviving evidence. A row that never declared a rate
++  // keeps the legacy `isFree` bit verbatim — false included — because that bit predates
++  // this addon, other providers set it, and upstream uses it to carry a paid verdict
++  // through the cache round trip.
++  const creditMultiplier =
++    typeof record.creditMultiplier === "number" &&
++    Number.isFinite(record.creditMultiplier) &&
++    record.creditMultiplier >= 0
++      ? record.creditMultiplier
++      : undefined;
++  const declaresRate = record.creditMultiplier !== undefined && record.creditMultiplier !== null;
++  const isFree =
++    creditMultiplier === undefined
++      ? declaresRate
++        ? undefined
++        : record.isFree
++      : creditMultiplier === 0;
++
+   return {
+     id,
+     name,
+@@ -132,7 +159,8 @@ function normalizeSyncedAvailableModel(model: unknown): SyncedAvailableModel | n
+     ...(record.alwaysThinking === true ? { alwaysThinking: true } : {}),
+     ...(typeof record.supportsTools === "boolean" ? { supportsTools: record.supportsTools } : {}),
+     ...(typeof record.supportsVideo === "boolean" ? { supportsVideo: record.supportsVideo } : {}),
+-    ...(typeof record.isFree === "boolean" ? { isFree: record.isFree } : {}),
++    ...(typeof isFree === "boolean" ? { isFree } : {}),
++    ...(creditMultiplier !== undefined ? { creditMultiplier } : {}),
+     ...(record.supportsVision === true ? { supportsVision: true } : {}),
+     ...(typeof record.dimensions === "number" && record.dimensions > 0
+       ? { dimensions: record.dimensions }
+diff --git a/src/lib/providerModels/modelDiscovery.ts b/src/lib/providerModels/modelDiscovery.ts
+index 0661ecaf..a3e4d2b0 100644
+--- a/src/lib/providerModels/modelDiscovery.ts
++++ b/src/lib/providerModels/modelDiscovery.ts
+@@ -684,7 +684,20 @@ export function normalizeDiscoveredModels(
+     // Persist only evidence present in this discovery payload. Static catalog
+     // membership is intentionally not evidence about this connection's economics.
+     const explicitlyPaid = providerId === "siliconflow" && hasPayloadPaidEvidence(record);
+-    const isFree = !explicitlyPaid && hasPayloadFreeEvidence({ ...record, id });
++    // WorkBuddy declares its economics as a `credits` multiplier rather than as a free
++    // tag. The rate is forwarded verbatim and decides the free bit when present: an
++    // explicit positive rate beats the `-free`-suffix heuristic, and `0` IS the upstream's
++    // own "free". Absent a rate, the payload evidence below stays authoritative.
++    const creditMultiplier =
++      typeof record.creditMultiplier === "number" &&
++      Number.isFinite(record.creditMultiplier) &&
++      record.creditMultiplier >= 0
++        ? record.creditMultiplier
++        : undefined;
++    const isFree =
++      creditMultiplier !== undefined
++        ? creditMultiplier === 0
++        : !explicitlyPaid && hasPayloadFreeEvidence({ ...record, id });
+ 
+     deduped.set(id, {
+       id,
+@@ -728,6 +741,9 @@ export function normalizeDiscoveredModels(
+       ...(record.alwaysThinking === true ? { alwaysThinking: true } : {}),
+       ...(typeof record.supportsTools === "boolean" ? { supportsTools: record.supportsTools } : {}),
+       ...(typeof record.supportsVideo === "boolean" ? { supportsVideo: record.supportsVideo } : {}),
++      // The declared rate travels with the row it decided; the read path re-derives
++      // `isFree` from it (db/models/synced.ts), so a restart cannot erase the verdict.
++      ...(creditMultiplier !== undefined ? { creditMultiplier } : {}),
+       // Keep a paid verdict through the cache round trip: dropping false would
+       // let a :free suffix or a prior optimistic flag grant access again.
+       ...(explicitlyPaid ? { isFree: false } : isFree ? { isFree: true } : {}),
+diff --git a/tests/unit/workbuddy-provider.test.ts b/tests/unit/workbuddy-provider.test.ts
+index a8051ced..ee58d516 100644
+--- a/tests/unit/workbuddy-provider.test.ts
++++ b/tests/unit/workbuddy-provider.test.ts
+@@ -413,7 +413,26 @@ describe("model discovery", () => {
+       name: string;
+       owned_by: string;
+     }>;
+-    assert.deepEqual(models, [{ id: "gpt-5.5", name: "GPT-5.5", owned_by: "workbuddy" }]);
++    // Enriched projection (addon A3): the windows, the flags, the singular-form reasoning
++    // ladder and the declared rate all travel with the entry; an entry that declares no
++    // description/tags carries neither key.
++    assert.deepEqual(models, [
++      {
++        id: "gpt-5.5",
++        name: "GPT-5.5",
++        owned_by: "workbuddy",
++        context_length: 1_000_000,
++        max_input_tokens: 1_000_000,
++        max_output_tokens: 72_000,
++        supportsVision: true,
++        supportsTools: true,
++        supportsThinking: true,
++        supportedThinkingEfforts: ["low", "medium", "high", "xhigh", "max"],
++        defaultThinkingEffort: "high",
++        creditMultiplier: 3.31,
++        isFree: false,
++      },
++    ]);
+   });
+ 
+   it("keeps a chat entry that carries a non-media tag", () => {

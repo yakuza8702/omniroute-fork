@@ -1,8 +1,12 @@
-# omniroute-fork — prebuilt-release docker image pipeline
+# omniroute-fork — docker image pipeline (prebuilt npm package / source + addon)
 #
 # manual dispatch only — never triggered by push/tag/schedule.
 # amd64-only by design — single-architecture builds only.
-# No compilation: the image is assembled from the pinned `omniroute` npm package.
+#
+# build_mode=prebuilt (default): no compilation; the image is assembled from the pinned
+#   `omniroute` npm package. Unchanged behaviour, still the path for the 3.8.52 line.
+# build_mode=source: the image is compiled from the upstream commit in `source_ref` with
+#   `addon/` overlaid (Dockerfile.source) and tagged `:<version>-wb`.
 
 name: docker-image
 
@@ -19,6 +23,21 @@ on:
         required: false
         type: boolean
         default: false
+      build_mode:
+        description: "Image source: prebuilt (pinned npm package, unchanged) or source (pinned upstream commit + addon/ overlay)"
+        required: true
+        type: choice
+        options:
+          - prebuilt
+          - source
+        # NOTE: the plan (§7.3) defaults this to `source`. It stays `prebuilt` until the source
+        # image has passed the rollout checklist twice — the documented flip, not an automatic one.
+        default: prebuilt
+      source_ref:
+        description: "build_mode=source: upstream commit to build. FULL 40-hex SHA — the shallow fetch rejects an abbreviated ref."
+        required: false
+        type: string
+        default: "e9cb075cf6db161661b01f5dde2a1f0b033f7660"
 
 permissions:
   contents: read
@@ -32,7 +51,9 @@ jobs:
   build:
     name: build-and-push-amd64
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # A source build takes 12-20 min of compile plus install on a 16 GB runner; the
+    # prebuilt path never comes close, so one ceiling serves both.
+    timeout-minutes: 90
     env:
       IMAGE_GHCR: ghcr.io/yakuza8702/omniroute-fork
       IMAGE_DOCKERHUB: docker.io/yakuza8702/omniroute
@@ -44,11 +65,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Normalize version
+      - name: Normalize version and build mode
         shell: bash
         env:
           RAW_VERSION: ${{ inputs.version }}
           PROMOTE_LATEST: ${{ inputs.promote_latest }}
+          BUILD_MODE: ${{ inputs.build_mode }}
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
           VERSION="${RAW_VERSION#v}"   # strip a single leading v, e.g. v3.8.52 -> 3.8.52
@@ -65,9 +88,38 @@ jobs:
           fi
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
           echo "PROMOTE_LATEST=${PROMOTE_LATEST}" >> "${GITHUB_ENV}"
-          echo "Resolved version: ${VERSION} (promote_latest=${PROMOTE_LATEST})"
+
+          # build_mode gates which image is produced. `prebuilt` is the historical path and
+          # must keep behaving exactly as before; `source` compiles the pinned commit.
+          MODE="${BUILD_MODE:-prebuilt}"
+          case "${MODE}" in
+            prebuilt|source) ;;
+            *)
+              echo "::error::invalid build_mode \"${MODE}\" — expected prebuilt or source"
+              exit 1
+              ;;
+          esac
+          echo "BUILD_MODE=${MODE}" >> "${GITHUB_ENV}"
+
+          if [ "${MODE}" = "source" ]; then
+            # A shallow `git fetch origin <ref>` rejects anything but a full object id, and the
+            # Dockerfile asserts HEAD == SOURCE_REF byte for byte. Catch it here, before a
+            # 90-minute build spends its first step proving it.
+            if ! printf '%s' "${SOURCE_REF}" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::source_ref must be a full 40-hex commit SHA (got \"${SOURCE_REF}\")"
+              exit 1
+            fi
+            echo "SOURCE_REF=${SOURCE_REF}" >> "${GITHUB_ENV}"
+            echo "IMAGE_TAG=${VERSION}-wb" >> "${GITHUB_ENV}"
+            echo "Resolved source build: ${VERSION} @ ${SOURCE_REF} → tag ${VERSION}-wb"
+          else
+            echo "IMAGE_TAG=${VERSION}" >> "${GITHUB_ENV}"
+            echo "Resolved prebuilt build: omniroute@${VERSION} → tag ${VERSION}"
+          fi
+          echo "Resolved version: ${VERSION} (promote_latest=${PROMOTE_LATEST}, build_mode=${MODE})"
 
       - name: Preflight — verify the pinned npm package exists
+        if: ${{ env.BUILD_MODE == 'prebuilt' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -130,6 +182,15 @@ jobs:
           echo "OMNIROUTE_BIN=/usr/local/bin/${BIN_NAME}" >> "${GITHUB_ENV}"
           echo "Resolved global bin: /usr/local/bin/${BIN_NAME}"
 
+      - name: Note — source build skips the npm preflight
+        if: ${{ env.BUILD_MODE == 'source' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A source build does not consume the npm package at all; provenance is the commit
+          # pin asserted inside Dockerfile.source (HEAD == SOURCE_REF, package version match).
+          echo "::notice::build_mode=source — npm preflight skipped; building ${SOURCE_REF}."
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -144,8 +205,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          GH_TAGS="${IMAGE_GHCR}:${VERSION}"
-          DH_TAGS="${IMAGE_DOCKERHUB}:${VERSION}"
+          # `:<version>` for the prebuilt package (unchanged), `:<version>-wb` for the source
+          # build. The flip to `<version>` for source happens only after two clean source
+          # builds (plan §7.3/§11 step 5) and is a documented edit, never automatic.
+          GH_TAGS="${IMAGE_GHCR}:${IMAGE_TAG}"
+          DH_TAGS="${IMAGE_DOCKERHUB}:${IMAGE_TAG}"
           if [ "${PROMOTE_LATEST}" = "true" ]; then
             GH_TAGS="${GH_TAGS},${IMAGE_GHCR}:latest"
             DH_TAGS="${DH_TAGS},${IMAGE_DOCKERHUB}:latest"
@@ -154,8 +218,10 @@ jobs:
           echo "DH_TAGS=${DH_TAGS}" >> "${GITHUB_ENV}"
           echo "GHCR tags: ${GH_TAGS}"
 
-      - name: Build image (linux/amd64, no push yet)
+      # ---- prebuilt: unchanged path — pinned npm package, no compilation ----
+      - name: Build image — prebuilt npm package (linux/amd64, no push yet)
         id: build
+        if: ${{ env.BUILD_MODE == 'prebuilt' }}
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -175,12 +241,40 @@ jobs:
             org.opencontainers.image.version=${{ env.VERSION }}
             org.opencontainers.image.title=omniroute-fork
 
+      # ---- source: pinned upstream commit + addon/ overlay (Dockerfile.source) ----
+      - name: Build image — source + workbuddy addon (linux/amd64, no push yet)
+        id: build-source
+        if: ${{ env.BUILD_MODE == 'source' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile.source
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.GH_TAGS }}
+          # ADDON_REV is the addon's own commit: it is a cache key, so editing addon/ rebuilds
+          # the overlay layer even when SOURCE_REF has not moved.
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            SOURCE_REF=${{ env.SOURCE_REF }}
+            ADDON_REV=${{ github.sha }}
+          cache-from: type=gha,scope=docker-amd64-src
+          cache-to: type=gha,mode=max,scope=docker-amd64-src
+          labels: |
+            org.opencontainers.image.source=https://github.com/yakuza8702/omniroute-fork
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.title=omniroute-fork
+            org.opencontainers.image.revision=${{ env.SOURCE_REF }}
+
       # ---- Gate: smoke test runs BEFORE anything is pushed to a registry ----
       - name: Smoke test container (pre-push gate)
         shell: bash
         run: |
           set -euo pipefail
-          IMAGE="${IMAGE_GHCR}:${VERSION}"
+          # Generic port-reachability gate for BOTH modes (plan §7.3): the addon routes are
+          # asserted from rollout step 3 (§11), not in this build gate.
+          IMAGE="${IMAGE_GHCR}:${IMAGE_TAG}"
           CID="$(docker run --detach --name omniroute-smoke -p 127.0.0.1:0:20128 "${IMAGE}")"
           cleanup() {
             docker logs --tail 120 "${CID}" || true
@@ -254,7 +348,7 @@ jobs:
           # so this is a re-tag + push — no second build, no compilation.
           IFS=',' read -r -a TAGS <<< "${DH_TAGS}"
           for tag in "${TAGS[@]}"; do
-            docker tag "${IMAGE_GHCR}:${VERSION}" "${tag}"
+            docker tag "${IMAGE_GHCR}:${IMAGE_TAG}" "${tag}"
             docker push "${tag}"
           done
           echo "DOCKERHUB_PUSHED=1" >> "${GITHUB_ENV}"
@@ -272,10 +366,16 @@ jobs:
           {
             echo "### omniroute-fork image published"
             echo ""
-            echo "- version: \`${VERSION}\` (npm package \`omniroute@${VERSION}\`)"
+            echo "- version: \`${VERSION}\`"
+            echo "- build_mode: \`${BUILD_MODE}\`"
+            if [ "${BUILD_MODE}" = "source" ]; then
+              echo "- source: \`${SOURCE_REF}\` + \`addon/\` overlay (Dockerfile.source)"
+            else
+              echo "- package: npm \`omniroute@${VERSION}\` (Dockerfile)"
+              echo "- entrypoint bin: \`${OMNIROUTE_BIN}\`"
+            fi
             echo "- platform: \`linux/amd64\` (single-architecture build)"
             echo "- promote_latest: \`${PROMOTE_LATEST}\`"
-            echo "- entrypoint bin: \`${OMNIROUTE_BIN}\`"
             echo ""
             echo "#### GHCR tags (smoke-tested, pushed)"
             echo ""

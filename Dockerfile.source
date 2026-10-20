@@ -1,0 +1,187 @@
+# syntax=docker/dockerfile:1.7
+#
+# omniroute-fork — SOURCE image (build_mode=source)
+#
+# Assembles the image from the upstream OmniRoute source tree at a pinned commit and applies
+# the WorkBuddy addon (addon/overlay.sh) before compiling. Three stages, mirroring upstream's
+# own Dockerfile so the runtime contract is identical to the prebuilt image:
+#
+#   fetch   → clone the exact commit, verify it, overlay addon/
+#   builder → npm ci + native better-sqlite3 + webpack `npm run build`
+#   runner  → standalone layout, non-root `node`, PORT 20128, DATA_DIR=/app/data
+#
+# Why: the addon touches typed server modules and (later) client components and shared hooks.
+# Byte-unique anchor splicing of minified dist chunks cannot express that; a source build can.
+# The prebuilt Dockerfile is untouched and keeps serving the 3.8.52 line.
+#
+# Usage:
+#   docker build -f Dockerfile.source \
+#     --build-arg VERSION=3.8.53 \
+#     --build-arg SOURCE_REF=e9cb075cf6db161661b01f5dde2a1f0b033f7660 \
+#     --build-arg ADDON_REV=$(git rev-parse HEAD) -t omniroute:3.8.53-wb .
+#
+# Build args:
+#   VERSION      upstream package version to build; ASSERTED against package.json (no guessing)
+#   SOURCE_REF   full 40-hex commit SHA (git rejects abbreviated wants for a shallow fetch)
+#   ADDON_REV    cache-buster for addon/; pass the addon commit sha so a change rebusts the layer
+#   APT_MIRROR   deb mirror for builders that cannot reach deb.debian.org
+#   NPM_REGISTRY npm mirror for builders that cannot reach registry.npmjs.org
+#
+ARG NODE_IMAGE=node:26-trixie-slim
+
+# ── Stage 1: fetch the exact source tree and overlay the addon ─────────────────
+FROM ${NODE_IMAGE} AS fetch
+
+ARG SOURCE_REPO=https://github.com/diegosouzapw/OmniRoute.git
+ARG SOURCE_REF=e9cb075cf6db161661b01f5dde2a1f0b033f7660
+ARG VERSION=3.8.53
+ARG ADDON_REV=dev
+ARG APT_MIRROR=http://deb.debian.org
+
+# git for the fetch, ca-certificates for TLS. `sed` mirrors the Debian sources like
+# upstream's base stage (Dockerfile:31-38), so an APT_MIRROR user gets the same behaviour here.
+RUN --mount=type=cache,id=wb-apt,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,id=wb-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+  sed -i -E "s|https?://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends git ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Full-SHA pin, verified three ways, because the rest of the build trusts this tree:
+#   1. the fetch only asks for the exact commit,
+#   2. HEAD must equal SOURCE_REF byte for byte (a moved tag or a truncated ref fails here),
+#   3. package.json version must equal VERSION (a source/image version mismatch fails here
+#      rather than at runtime, where it would silently mislabel the published tag).
+RUN git init /src \
+  && git -C /src remote add origin "${SOURCE_REPO}" \
+  && git -C /src fetch --depth=1 origin "${SOURCE_REF}" \
+  && git -C /src checkout --detach FETCH_HEAD \
+  && test "$(git -C /src rev-parse HEAD)" = "${SOURCE_REF}" \
+  && test "$(node -p "require('/src/package.json').version")" = "${VERSION}"
+
+# ADDON_REV participates in this layer's identity: a new addon commit yields a new layer even
+# when SOURCE_REF is unchanged. `echo` keeps the ARG referenced (an unused ARG is not a
+# cache key).
+RUN echo "overlay addon rev: ${ADDON_REV}"
+COPY addon/ /src/addon/
+
+# FAIL-CLOSED: overlay.sh copies addon/files/, proves every patch with `git apply --check`
+# before applying any, then asserts every post-condition marker. A drifted anchor stops the
+# build here, with an unmodified tree.
+# Cleanup after a successful overlay, both for size and for correctness:
+#   - addon/files/src/** is a second copy of a few source modules and `tsconfig.json` includes
+#     `**/*.ts`, so leaving it would typecheck duplicate modules and confuse knip;
+#   - .git is excluded from upstream's own build context (.dockerignore), and `npm run build`
+#     never shells out to git (`write-build-sha` belongs to `build:release`), so the shallow
+#     clone's objects are dead weight in every later layer.
+RUN bash /src/addon/overlay.sh /src \
+  && rm -rf /src/addon /src/.git
+
+# ── Stage 2: build (mirrors upstream Dockerfile builder) ──────────────────────
+FROM ${NODE_IMAGE} AS builder
+
+ARG NPM_REGISTRY=
+ARG NODE_DIST_URL=
+ARG APT_MIRROR=http://deb.debian.org
+# Upstream builds in /app; every build script here is cwd-relative (scripts/build/*.mjs use
+# `process.cwd()`), so /src works identically and keeps the fetch-stage paths readable.
+WORKDIR /src
+
+# Dockerfile:90 — no Next.js build-time telemetry.
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Dockerfile:94-98 — build tools for native modules; apt-get update is needed because the
+# base image's lists were cleared at the end of the fetch stage.
+RUN --mount=type=cache,id=wb-apt,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,id=wb-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+  sed -i -E "s|https?://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+  && if [ -n "${NPM_REGISTRY}" ]; then npm config set registry "${NPM_REGISTRY}"; fi \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends python3 make g++ \
+  && rm -rf /var/lib/apt/lists/*
+
+# The whole verified+overlaid tree, including package-lock.json (the repo's reproducible
+# install path is `npm ci` — no yarn, no pnpm).
+COPY --from=fetch /src /src
+
+ENV NPM_CONFIG_LEGACY_PEER_DEPS=true
+
+# Dockerfile:118-119 — a committed lockfile is required for a reproducible build.
+RUN test -f package-lock.json \
+  || (echo "package-lock.json is required for reproducible Docker builds" >&2 && exit 1)
+
+# Dockerfile:130-137 — install with broad lifecycle scripts disabled, then rebuild ONLY
+# better-sqlite3 (the one native runtime dependency) with the image's bundled node-gyp, and
+# smoke-test it. `--include=optional` keeps the optional native packs the build needs.
+RUN --mount=type=cache,id=wb-npm,target=/root/.npm \
+  npm ci --include=optional --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
+  && (cd node_modules/better-sqlite3 \
+      && if [ -n "${NODE_DIST_URL}" ]; then export NODEJS_ORG_MIRROR="${NODE_DIST_URL}"; fi \
+      && node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild --force_build=1) \
+  && test -f node_modules/better-sqlite3/build/Release/better_sqlite3.node \
+  && node -e "require('better-sqlite3')(':memory:').close()"
+
+# Dockerfile:162-163 — webpack, not Turbopack. Declared ARG+ENV (a bare ENV would shadow the
+# build-arg and silently ignore `--build-arg OMNIROUTE_USE_TURBOPACK=1`).
+ARG OMNIROUTE_USE_TURBOPACK=0
+ENV OMNIROUTE_USE_TURBOPACK="${OMNIROUTE_USE_TURBOPACK}"
+
+# Dockerfile:185 — containers cannot run the MITM/Agent-Bridge stack, so keep the stub.
+ENV OMNIROUTE_MITM_STUB=1
+
+# Dockerfile:198-199 — V8 heap ceiling for the production optimization pass.
+ARG OMNIROUTE_BUILD_MEMORY_MB=6144
+ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
+
+# Dockerfile:230-231 — cap Next's page-data workers (Next derives them from CIRCLE_NODE_TOTAL).
+ARG OMNIROUTE_BUILD_WORKERS=2
+ENV CIRCLE_NODE_TOTAL=${OMNIROUTE_BUILD_WORKERS}
+
+# Dockerfile:234-236 — build. `assembleStandalone` writes .build/next/standalone relative to
+# the working copy, so the runner stage copies that path verbatim.
+RUN --mount=type=cache,id=wb-next,target=/src/.build/next/cache \
+  mkdir -p /src/data \
+  && npm run build
+
+# ── Stage 3: runtime (same layout as upstream Dockerfile:240-316) ─────────────
+FROM ${NODE_IMAGE} AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production \
+    PORT=20128 \
+    HOSTNAME=0.0.0.0 \
+    DATA_DIR=/app/data \
+    OMNIROUTE_MIGRATIONS_DIR=/app/migrations
+
+# Runtime heap ceiling (override with -e OMNIROUTE_MEMORY_MB=2048 for large fusion panels).
+ENV OMNIROUTE_MEMORY_MB=1024
+ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_MEMORY_MB}"
+
+# The published image requires an API key by default; an operator's env file overrides it.
+ENV REQUIRE_API_KEY=true
+
+RUN mkdir -p /app/data && chown node:node /app /app/data
+
+# Dockerfile:284-290 — the complete standalone tree plus the one package Next's tracing may
+# leave incomplete (bootstrap-env needs SQLite before the server starts).
+COPY --chown=node:node --from=builder /src/.build/next/standalone ./
+COPY --chown=node:node --from=builder /src/node_modules/better-sqlite3 ./node_modules/better-sqlite3
+RUN test -f /app/node_modules/better-sqlite3/build/Release/better_sqlite3.node
+
+# Dockerfile:294-296 — healthcheck script, not traced into the standalone output.
+COPY --chown=node:node --from=builder /src/scripts/dev/healthcheck.mjs ./healthcheck.mjs
+# Dockerfile:310-311 — warns about a data volume with the wrong ownership, then execs CMD.
+COPY --chmod=755 --from=builder /src/scripts/check-permissions.sh /app/check-permissions.sh
+
+EXPOSE 20128
+USER node
+ENTRYPOINT ["/app/check-permissions.sh"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["node", "healthcheck.mjs"]
+CMD ["node", "dev/run-standalone.mjs"]
+
+LABEL org.opencontainers.image.title="omniroute-fork" \
+  org.opencontainers.image.description="OmniRoute source build with the WorkBuddy addon" \
+  org.opencontainers.image.source="https://github.com/yakuza8702/omniroute-fork" \
+  org.opencontainers.image.licenses="MIT"
