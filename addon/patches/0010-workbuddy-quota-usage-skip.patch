@@ -1,0 +1,102 @@
+diff --git a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCard.tsx b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCard.tsx
+index b67e9dc2..1770c1b7 100644
+--- a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCard.tsx
++++ b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCard.tsx
+@@ -168,35 +168,41 @@ export default function QuotaCard({
+         togglingActive={togglingActive}
+         onTestSent={onRefresh}
+       />
+-      <QuotaCardExpanded
+-        quotas={quotas}
+-        quotaGroups={quota?.raw?.quotaGroups}
+-        providerId={connection.provider}
+-        loading={loading}
+-        error={error}
+-        message={quota?.message ?? null}
+-        paidCredits={connection.provider === "codex" ? quota?.raw?.paidCredits : undefined}
+-        billing={
+-          isProviderBillingProvider(connection.provider)
+-            ? (quota?.billing ?? quota?.raw?.billing)
+-            : null
+-        }
+-        refreshedAt={displayRefreshedAt}
+-        hasStaleData={hasStaleData}
+-        onRefresh={onRefresh}
+-        onOpenCutoff={onOpenCutoff}
+-        onOpenCost={() => setCostModalOpen(true)}
+-        onOpenResetCredits={onOpenResetCredits}
+-        hiddenQuotaRows={hiddenQuotaRows}
+-        onHideQuota={onHideQuota}
+-        onShowQuota={onShowQuota}
+-        speed={quota?.raw?.speed}
+-        canEditCutoff={canEditCutoff}
+-        hasCutoffOverrides={hasOverrides}
+-        canRedeemResetCredit={canRedeemResetCredit}
+-        redeemingResetCredit={redeemingResetCredit}
+-        loadingResetCredits={loadingResetCredits}
+-      />
++      {creditsSlot ? null : (
++        /* A WorkBuddy card has no usage body: its whole meter is the credits strip below
++           (the provider reports quota via /api/workbuddy/credits, not /api/usage). Rendering
++           the generic details block here would only say "no quota data" over a live
++           credit balance, so the slot replaces it. */
++        <QuotaCardExpanded
++          quotas={quotas}
++          quotaGroups={quota?.raw?.quotaGroups}
++          providerId={connection.provider}
++          loading={loading}
++          error={error}
++          message={quota?.message ?? null}
++          paidCredits={connection.provider === "codex" ? quota?.raw?.paidCredits : undefined}
++          billing={
++            isProviderBillingProvider(connection.provider)
++              ? (quota?.billing ?? quota?.raw?.billing)
++              : null
++          }
++          refreshedAt={displayRefreshedAt}
++          hasStaleData={hasStaleData}
++          onRefresh={onRefresh}
++          onOpenCutoff={onOpenCutoff}
++          onOpenCost={() => setCostModalOpen(true)}
++          onOpenResetCredits={onOpenResetCredits}
++          hiddenQuotaRows={hiddenQuotaRows}
++          onHideQuota={onHideQuota}
++          onShowQuota={onShowQuota}
++          speed={quota?.raw?.speed}
++          canEditCutoff={canEditCutoff}
++          hasCutoffOverrides={hasOverrides}
++          canRedeemResetCredit={canRedeemResetCredit}
++          redeemingResetCredit={redeemingResetCredit}
++          loadingResetCredits={loadingResetCredits}
++        />
++      )}
+       {creditsSlot ? (
+         /* Credits constraint: the pooled WorkBuddy credit meter replaces the gauge list this
+            card cannot fill. Separated by the same hairline the card uses between sections. */
+diff --git a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx
+index 9f293a59..fd76c6f2 100644
+--- a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx
++++ b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx
+@@ -36,7 +36,7 @@ import { formatAutoRefreshCountdown } from "./formatters";
+ import { translateUsageOrFallback, type UsageTranslationValues } from "./i18nFallback";
+ import { compareTr } from "@/shared/utils/turkishText";
+ import { fetchWithTimeout } from "@/shared/utils/fetchTimeout";
+-import { workBuddyCreditsForDisplay } from "@/shared/utils/workBuddyCredit";
++import { shouldFetchUsage, workBuddyCreditsForDisplay } from "@/shared/utils/workBuddyCredit";
+ import { WorkBuddyPoolCreditBadge } from "@/app/(dashboard)/dashboard/providers/[id]/components/WorkBuddyPoolCreditBadge";
+ 
+ // Bound the two first-paint requests so a stalled connection cannot wedge
+@@ -381,6 +381,13 @@ export default function ProviderLimits({
+ 
+   const fetchQuota = useCallback(
+     async (connectionId: string, provider: string, options: { force?: boolean } = {}) => {
++      // WorkBuddy reports quota via /api/workbuddy/credits (the pool snapshot), not
++      // /api/usage/{id}: the generic route answers 400 "Usage not available for this
++      // connection", and that message is what the card drew as a red banner beside its credits
++      // strip. Skip BEFORE touching loading/error state, so a WorkBuddy card stays on its own
++      // meter; every caller (first paint, refresh, the stale-row probe retry) funnels through
++      // here, so this one gate covers them all.
++      if (!shouldFetchUsage(provider)) return;
+       const force = options?.force === true;
+       const now = Date.now();
+       const lastFetch = lastFetchTimeRef.current[connectionId] || 0;

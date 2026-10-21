@@ -26,7 +26,7 @@ Citation convention: `path:lines` is relative to the overlay target (the upstrea
 | `src/lib/workbuddy/freeModel.ts:1-89` | `src/lib/workbuddy/freeModel.ts` | Verbatim: `selectWorkBuddyFreeModel` (largest window wins; `undefined` is NOT free), `listWorkBuddyFreeModels`, `rankWorkBuddyModelsByCost`, `describeWorkBuddyFreeModel`. |
 | `src/lib/workbuddy/poolQuota.ts:1-732` (trimmed) | `src/lib/workbuddy/poolQuota.ts` | Single edition. Keeps the 10-minute snapshot TTL (`WORKBUDDY_QUOTA_SNAPSHOT_TTL_MS`), per-connection in-flight dedupe (`batchFor`), `Promise.allSettled` per-account isolation, `diagnoseWorkBuddyFailure`, `invalidateWorkBuddyQuotaSnapshot` and `selectWorkBuddyQuotaAccount`. ADDED a `deps` seam (`WorkBuddyPoolProbeDeps`: `listConnections`/`readCredits`) so T6 can drive the engine without a database — production never passes it. Dropped: the multi-edition loop, the shape-walking pool-state reader (replaced by one typed sibling call) and the check-in invalidation call. |
 | `src/lib/workbuddy/poolState.ts:1-453` (reader + gated writer) | `src/lib/workbuddy/poolState.ts` | The document shape is fork-compatible (`version` + `cid → {connectionId, reason, retryDueMs, updatedAt}`), the read uses `O_NOFOLLOW` and is fail-open, the write is atomic (0600 + rename). Trimmed: the failure-kind vocabulary and the merge rule belonged to the executor path this port does not ship. **The writer is off by default**: `workBuddyPoolStateWriterEnabled()` is true only for `WORKBUDDY_POOL_STATE=1` (plan §C3/§R4), so the image never creates files on the data volume unless asked. |
-| `src/shared/utils/workBuddyCredit.ts:27-78` | `src/shared/utils/workBuddyCredit.ts` | Verbatim and client-safe (no DB, no env): `isWorkBuddyProviderId`, `declaredWorkBuddyCreditMultiplier`, `workBuddyPriceTier`, `formatWorkBuddyCreditBadge`. **Wave 5** appended `workBuddyCreditsForDisplay(connection)` — the Provider Quota admission gate that returns the connection id to probe (family match + non-empty id) or `null`, so admitting a card and scoping its badge are one decision. |
+| `src/shared/utils/workBuddyCredit.ts:27-78` | `src/shared/utils/workBuddyCredit.ts` | Verbatim and client-safe (no DB, no env): `isWorkBuddyProviderId`, `declaredWorkBuddyCreditMultiplier`, `workBuddyPriceTier`, `formatWorkBuddyCreditBadge`. **Wave 5** appended `workBuddyCreditsForDisplay(connection)` — the Provider Quota admission gate that returns the connection id to probe (family match + non-empty id) or `null`, so admitting a card and scoping its badge are one decision. **Wave 6** appended `shouldFetchUsage(providerId)` — the complement of that gate for the card's usage fetch (`GET /api/usage/{id}` answers 400 for this provider); see `0010`. |
 | — (new) | `src/shared/utils/workBuddyEfforts.ts` | The override vocabulary = INTERSECTION of the gateway ladder (adds `minimal`) and the override parser (adds `ultra`): `none, low, medium, high, xhigh, max` (plan §6/R7), plus parse/serialize/toggle/format helpers. |
 | `src/app/api/workbuddy/_lib.ts:1-216` | `src/app/api/workbuddy/_lib.ts` | Single edition, `requireManagementAuth` guard, sanitized error bodies, edition/account resolution, credit shaping. Dropped: the `loopbackOnly` claim (these routes are management-authenticated, not loopback-only) and the accounts/import/checkin route table. |
 | `src/app/api/workbuddy/models/route.ts`, `free-model/route.ts` | same paths | Verbatim shape, single-edition copy ("Unknown provider. Use workbuddy."). |
@@ -43,6 +43,7 @@ Citation convention: `path:lines` is relative to the overlay target (the upstrea
 | — (new) | `src/shared/utils/workBuddyCreditProbe.ts` | **Wave 4 (§C4 follow-up).** The badge's promotion rule as a pure predicate: `needsWorkBuddyFullCreditProbe(body)` is true when any edition reports `pending` or any account's `status` is `unknown` (or absent), and false for `ok`/`error`/`excluded`, an edition with no rows, and an empty body. Client-safe (no env, no DB), so the component and T8 share one source of truth instead of an inline condition the test would have to restate. |
 | — | `tests/unit/workbuddy-pool-badge.test.ts` | New (wave 4, T8): the promotion predicate — promotes on `pending: 1`, on any `unknown` row, on a status-less row and on a later edition; does **not** promote on `ok`/`error`/`excluded`, on an edition with no rows, or on an empty/absent body (those would be billing-call loops, not display fixes). |
 | — (new) | `docs/reference/WORKBUDDY_ADDON.md` | **Wave 5 operator brief.** What ships per wave, upstream-vs-patched (device code, B1v2 key, known-free rule, compact trigger, the missing quota card), the known gaps (workbuddy-global, desktop scan, env-doc debt, no aggregate bar), removal via `WORKBUDDY_ADDON=0`, the five-step resume, and the D-1..D-36 index. Copy-delivered (it is documentation, not a hunk) and indexed by `0008`; mirrored at `.handoff/HANDOFF-WORKBUDDY.md` in the fork-ci repo, which no build step consumes. |
+| — | `tests/unit/workbuddy-quota-usage-skip.test.ts` | New (wave 6, `0010`): the Provider Quota usage-fetch gate. Two halves — the pure predicate (`shouldFetchUsage`: the whole workbuddy family is skipped, every real quota provider is not, unknown/malformed ids fail OPEN) and the call site, pinned at source level because the harness renders no components (`index.tsx` calls the gate inside `fetchQuota`, before `/api/usage/${connectionId}` and before the loading/error state; `QuotaCard.tsx` does not render the generic quota body when a credits slot is present). See the wave-6 deviation on why the wiring needs a source-level pin. |
 | — | `tests/unit/workbuddy-opencode-premium.test.ts` | New (wave 4, `0005`): the free-lane rule at source level — the `-free` suffix and the legacy free ids stay free under a catalog that omits them, the catalog still decides for ids that make no free claim, an unknown id is premium with no synced catalog, and `opencode-go` stays fully keyed; plus the anonymous-key header contract (gated free request → env key; paid model, `/zen/go` surface and blank env → connection key; no credential and no env → no `Authorization`; zen Responses surface → `x-api-key`). |
 
 Tests live under `addon/files/tests/unit/` on purpose: `overlay.sh` copies them into the
@@ -232,6 +233,51 @@ the brief):
    `verification_uri[_complete] = authUrl`). A `400 "Provider does not support device code flow"`
    would mean the registry lost `flowType: "device_code"`; a UI that jumps to the PKCE step
    despite that `200` is exactly the bug `0009` fixes.
+
+## Modified files (`addon/patches/0010-workbuddy-quota-usage-skip.patch` — wave 6, usage-fetch skip)
+
+Wave 5 (`0007`) gave the WorkBuddy connection a Provider Quota card and put the pooled credit
+strip on it. It left the card's *other* quota path intact, and that path is the bug: the panel
+still issued the generic `GET /api/usage/{connectionId}` for the connection, and for WorkBuddy
+that route answers
+
+```json
+400 {"error":"Usage not available for this connection"}
+```
+
+— it is an OAuth provider with no usage backend (`USAGE_SUPPORTED_PROVIDERS` omits it, which is
+exactly why `0007` had to admit the card by hand). `fetchQuota` turns a non-OK response into an
+error string, `ProviderLimits` passes its `errors` map to `QuotaCard`, and `QuotaCardExpanded`
+renders it as a red banner under the header: a live credit balance with "Usage not available for
+this connection" printed next to it. WorkBuddy reports quota **only** through
+`GET /api/workbuddy/credits` (the pool snapshot the strip already reads), so the generic fetch is
+not a degraded answer there — it is the wrong source.
+
+The fix is one gate at the single choke point, plus the body suppression that makes the card say
+what it means.
+
+| Upstream anchor | Change | Origin |
+|---|---|---|
+| `src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx:382-390` (`fetchQuota`) | First statement of the callback: `if (!shouldFetchUsage(provider)) return;` behind a comment that names the route, the 400 body and the credits endpoint it defers to. It returns **before** `lastFetchTimeRef`, before `setLoading(… true)` and before `setErrors(… null)`, so a skipped connection never enters the loading or error maps and no banner can be painted from this path. Every caller — the auto-live effect (`shouldAutoRefreshQuota` → `fetchQuota`), `refreshProvider`, and the `staleAfterReset` self-probe retry inside `fetchQuota` — funnels through this one function, which is why the gate is here and not at three call sites. | wave-6 brief §1; `0007` follow-up |
+| `.../ProviderLimits/index.tsx:39` | The existing wave-5 import from the copied credit module gains `shouldFetchUsage` (same import, no new dependency edge). | wave-6 brief §1 |
+| `.../ProviderLimits/QuotaCard.tsx:171-202` | The generic `<QuotaCardExpanded/>` is now rendered only when there is **no** credits slot (`{creditsSlot ? null : (…)}`). `0007` had put the strip *under* the body, which for WorkBuddy only ever renders the italic "no quota data" line — a live credit balance over a "no data" notice. With the slot present, the card is header + credits strip, which is the whole truth about this provider's budget. The body keeps its refresh/cost/cutoff plumbing for every provider with real quota rows. | this port (see deviation 38) |
+| `addon/files/src/shared/utils/workBuddyCredit.ts` (copied file) | Appended `shouldFetchUsage(providerId): boolean` = `!isWorkBuddyProviderId(providerId)` over `unknown` input. Pure, client-safe, no React/env/DB — so the predicate is unit-testable without a component harness, and it uses **this** module's family predicate (canonical id, `wb`/`wbg`, any `workbuddy-*` spelling) rather than `lib/workbuddy/types`, because that is the same predicate `workBuddyCreditsForDisplay` admits the card with (deviation 37). Fails open: an id this list has never seen keeps its usage fetch. | wave-6 brief §2 |
+| `addon/overlay.sh` (governance) | Two markers — 43 → **45** assertions: the gate line itself (a card whose fetch still fires *is* the reported bug) and the comment that records where WorkBuddy quota actually comes from (the pool snapshot), which is the only place the next reader learns why the route is skipped. Both live inside `fetchQuota`. The card-body hunk carries no marker of its own; see deviation 38. | plan §2 |
+| `tests/unit/workbuddy-quota-usage-skip.test.ts` (new, copied file) | 9 cases: the family is skipped (canonical, aliases, `workbuddy-*`, case/padding); ten quota providers keep the fetch; unknown/malformed ids fail open; and a source-level pin that the gate sits inside `fetchQuota` **before** the request, before `setLoading` and before `setErrors`, exactly once — plus that `QuotaCard` omits the body when a slot is present. | wave-6 brief §2 |
+
+**Why the refresh paths need no second hunk.** `refreshAll()` is a *bulk* refresh: it POSTs
+`/api/usage/provider-limits` and never touches `/api/usage/{id}`. Its server half
+(`syncAllProviderLimits`) filters rows through `isSupportedUsageConnection`
+(`src/lib/usage/providerLimits.ts:205-214`), which for an OAuth row IS `supportsProviderQuota` —
+false for WorkBuddy — so the bulk `errors` map it returns cannot contain the connection, and
+`setErrors(data.errors || {})` therefore cannot re-paint the banner. Adding a client-side filter
+there would be dead code; the verification below proves the path is inert instead (deviation 39).
+
+**Why a source-level assertion is legitimate here.** `shouldFetchUsage` alone would pass a build
+where the gate was deleted from `fetchQuota` (the predicate is still correct and still tested), so
+the suite also reads the panel file: a real wiring assertion, not a restatement of the predicate.
+That is the same shape as `0005`'s source-level pins, and it is the only observable the harness
+has — the repo's `node --test` suite renders no client components (deviation 40).
 
 ### Deliberate deviations from the plan text (reported, not silent)
 
@@ -462,6 +508,47 @@ the brief):
     pool). Returning the id keeps admission and probing atomic and gives the unit test something
     falsifiable to assert. The name follows the wave-5 brief's own `workBuddyCreditsForDisplay`.
 
+**Wave 6:**
+
+37. **`shouldFetchUsage` lives in the copied credit module, not in `lib/workbuddy/types`.** The
+    brief offers `isWorkBuddyProviderId` from `@/lib/workbuddy/types` first ("if the import graph
+    allows"). It does allow it — that module is client-safe — but its resolver accepts only
+    `workbuddy` / `wb`, while the card is admitted by `workBuddyCreditsForDisplay`, which uses the
+    **credit module's** family predicate (canonical ids, `wb`/`wbg`, any `workbuddy-*` spelling).
+    Gating the fetch on the narrower resolver would reintroduce the bug for a `workbuddy-*`
+    connection: admitted as a card by one predicate, still fetching by the other. One family
+    definition for both halves is the only version that cannot diverge, so the gate reuses
+    `isWorkBuddyProviderId` from the module that already owns it and `index.tsx` imports no new
+    module.
+38. **The card body is suppressed, and that second hunk is not in the brief's file list.**
+    `0007`'s strip sat *after* `<QuotaCardExpanded/>`, and a WorkBuddy card's body is always
+    empty: no quotas, no message, so the only thing it can render is the italic `noQuotaData`
+    line. The brief's acceptance ("just the credits slot") is not met by silence on the error
+    alone — a "no quota data" notice over a live balance is the same wrong claim in grey. With a
+    credits slot present the body is therefore not rendered at all (one file, `QuotaCard.tsx`; no
+    prop is added to the generic `parts/QuotaCardExpanded.tsx`). It carries no third marker: the
+    marker budget for this wave is fixed at 45, `0007`'s `{creditsSlot ? (` marker still pins the
+    slot block, and `git apply` is all-or-nothing — a hunk cannot land partially, and a drifted
+    anchor fails the whole patch. If a later wave changes this block, the feature test's
+    `{creditsSlot ? null : (` assertion is what notices.
+39. **`refreshAll()` gets no skip hunk — the path is already inert, and the reasoning is recorded
+    instead of coded.** "BOTH the initial fetch and the `refreshAll()` re-fetch must skip" is the
+    right requirement, but `refreshAll` is a bulk POST whose server half filters connections
+    through `isSupportedUsageConnection` → `supportsProviderQuota` → false for WorkBuddy. It
+    issues no `/api/usage/{id}` request and its `errors` map cannot carry the connection, so a
+    client-side filter would be unreachable code that looks like a guard. The *per-connection*
+    paths that do exist (auto-live effect, `refreshProvider`, stale-probe retry) all go through
+    `fetchQuota`, which is exactly where the gate is. Verified: the overlaid tree's suite plus the
+    source-level pin (gate before the request), and the bulk route by inspection of
+    `providerLimits.ts:996,205-214`.
+40. **The wiring is asserted at source level, on top of the unit-tested predicate.** The brief
+    asks for a test "if the skip is implemented as a pure helper ... else document why no unit
+    test". Both halves are cheap and independent, so both shipped: `shouldFetchUsage` has nine
+    falsifiable cases (including failure-open), and the call site is pinned by reading
+    `index.tsx`/`QuotaCard.tsx`. The second is not redundant — deleting the gate would leave every
+    predicate case green — and it is the only observable available: the harness renders no client
+    components.
+
 ## DEFERRED (plan §12 — explicitly out of this port)
 
 * **CN edition + `workbuddy-global` provider id.** Needs a *new* id, not a rename: `workbuddy`
@@ -611,3 +698,31 @@ binary did not — set `TMPDIR` before `npm`, or call the binary; and the first 
 this wave failed **inside `overlay.sh` itself** because a marker comment contained an apostrophe
 inside the single-quoted `node -e` script — the shipped block avoids apostrophes and says so. No
 commit was made in this repository for wave 5b.
+
+## Verification performed for wave 6 (not a promise — the transcript is in the hand-off)
+
+One fresh oracle tree, built the same way as every previous wave — `rsync -a --exclude=.git
+--exclude=node_modules` of the upstream checkout @ `e9cb075c`, then `git init` + one commit:
+`/workspace/pkgtest_scratch16` (`3395d62`). Every number below was produced on that tree after a
+single `bash addon/overlay.sh /workspace/pkgtest_scratch16` run, not on an incrementally patched
+one.
+
+| Check | Command | Result |
+|---|---|---|
+| **The whole series, `0001`–`0010`** | `bash addon/overlay.sh /workspace/pkgtest_scratch16` | `overlay: copied 31 file(s)`, `overlay: preflight passed for 10 patch(es)`, `overlay: applied 0001…0010`, **45 post-condition assertions passed**, `overlay ok — 10 patch(es), 31 file(s)`, exit **0** |
+| Fail-closed | same command a second time | `overlay: ERROR — work tree has changes relative to HEAD in /workspace/pkgtest_scratch16 … nothing was applied`, exit **1** |
+| New suite | `TMPDIR=/workspace/.tmp_wave6 node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts --test tests/unit/workbuddy-quota-usage-skip.test.ts` | **9/9 pass**, exit **0** — family skip (3), fail-open/other-provider (2), call-site pin (3), card-body pin (1) |
+| WorkBuddy + golden suites | `… --test tests/unit/workbuddy-*.test.ts tests/unit/executor-map-golden.test.ts` | **122/122 pass**, exit **0** (120 workbuddy incl. the 9 new + 2 golden), `duration_ms` 16879 |
+| Core typecheck gate | `./node_modules/.bin/tsc --pretty false -p tsconfig.typecheck-core.json` | exit **0**, no diagnostics |
+| open-sse typecheck gate | `node scripts/check/check-open-sse-typecheck.mjs` | `openSseTypecheckErrors=0`, `OK — 0 pre-existing error(s)`, exit **0** |
+| Dashboard typecheck gate | `node scripts/check/check-dashboard-typecheck.mjs` | `OK — 196 pre-existing error(s), all within frozen baseline`, exit **0** (the two `index.tsx` diagnostics are the frozen `label` pair at `:1019`/`:1095`, none in the changed hunks) |
+| Format | `prettier --check` on the four touched files | `All matched files use Prettier code style!`, exit **0** |
+| Lint | `eslint` on the four touched files | 1 error, **pre-existing and lint-neutral**: `'aggregateWorst' is defined but never used` at `index.tsx:179`; the pristine file (`git show HEAD:…` piped to `eslint --stdin`) reports the identical error at `:177`, i.e. the same statement shifted by the two added lines. The three added files are clean. |
+| Patch shape | `git apply --stat addon/patches/0010-…` | 2 files, **+43 / −30** (`QuotaCard.tsx` 35/29 — the re-indented body render — and `index.tsx` 8/1) |
+
+Two environment notes for whoever replays this: the suites borrow
+`/workspace/pkgtest_scratch12/node_modules` through a symlink (the only installed tree on this
+host) and point `TMPDIR` at `/workspace/.tmp_wave6`; and `git init` in a fresh tree needs a local
+`user.name`/`user.email` before the seeding commit, or `overlay.sh` fails its own clean-tree
+precondition (`fatal: bad revision 'HEAD'`). No commit was made in the fork-ci repository for
+wave 6.

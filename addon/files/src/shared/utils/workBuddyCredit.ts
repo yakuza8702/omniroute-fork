@@ -103,3 +103,24 @@ export function workBuddyCreditsForDisplay(
   const connectionId = typeof connection.id === "string" ? connection.id.trim() : "";
   return connectionId.length > 0 ? connectionId : null;
 }
+
+/**
+ * Whether the Provider Quota panel may issue the generic per-connection usage fetch
+ * (`GET /api/usage/{id}`) for a provider (wave 6).
+ *
+ * WorkBuddy has no usage backend: the route answers `400 {"error":"Usage not available for this
+ * connection"}`, and the panel renders that string as a red error banner on the card — a card
+ * whose only real meter is the pooled credit strip beneath it. Its quota is reported by
+ * `GET /api/workbuddy/credits` (the pool snapshot), so the generic fetch is not merely useless
+ * there, it *is* the bug. Every other provider keeps the fetch.
+ *
+ * The gate is this module's own family predicate rather than `lib/workbuddy/types`, because it
+ * is the same predicate the card is admitted by ({@link workBuddyCreditsForDisplay}): one family
+ * definition for both halves, so a card can never be admitted while its usage fetch still fires.
+ *
+ * Fails open for unknown values on purpose — dropping a live usage card is worse than an error
+ * line for a provider id this list has never seen.
+ */
+export function shouldFetchUsage(providerId: unknown): boolean {
+  return !isWorkBuddyProviderId(typeof providerId === "string" ? providerId : null);
+}

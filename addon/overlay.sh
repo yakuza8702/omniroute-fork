@@ -223,6 +223,22 @@ const markers = [
   // be lost, so its presence is a build fact, not a nicety.
   ["docs/reference/meta.json", "\"WORKBUDDY_ADDON\""],
   ["docs/reference/WORKBUDDY_ADDON.md", "WORKBUDDY_ADDON=0"],
+  // 0010 — wave 6 (remedial). The generic per-connection usage route answers
+  // 400 "Usage not available for this connection" for workbuddy, and the card drew that string
+  // as a red banner beside its credits strip. Two markers: the gate itself (a card whose fetch
+  // still fires IS the reported bug) and the comment that says where the quota actually comes
+  // from — the only place the next reader learns it is the pool snapshot. Both sit inside
+  // fetchQuota, the single choke point every caller funnels through. The predicate behind the
+  // gate is a pure helper in shared/utils, so it also has a real unit suite
+  // (tests/unit/workbuddy-quota-usage-skip.test.ts) that pins the call site at source level.
+  [
+    "src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx",
+    "if (!shouldFetchUsage(provider)) return;",
+  ],
+  [
+    "src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx",
+    "reports quota via /api/workbuddy/credits",
+  ],
 ];
 
 let missing = 0;
