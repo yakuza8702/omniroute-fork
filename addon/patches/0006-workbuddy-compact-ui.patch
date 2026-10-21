@@ -1,0 +1,87 @@
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/ModelCompatPopover.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/ModelCompatPopover.tsx
+index abd88d58..bb7f63e6 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/ModelCompatPopover.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/ModelCompatPopover.tsx
+@@ -130,6 +130,11 @@ export interface ModelCompatPopoverProps {
+     }
+   ) => void;
+   showDeveloperToggle?: boolean;
++  /**
++   * Icon-only trigger. Used by the model rows (managed, passthrough and compatible), whose
++   * right column has no room for the label: the button matches the neighbouring
++   * visibility/eye icon button and keeps "Compatibility" as its tooltip and aria-label.
++   */
+   compact?: boolean;
+   disabled?: boolean;
+ }
+@@ -524,17 +529,33 @@ export default function ModelCompatPopover({
+ 
+   return (
+     <div className="relative inline-flex" ref={ref}>
+-      <button
+-        type="button"
+-        onClick={handleToggleOpen}
+-        disabled={disabled}
+-        className="inline-flex items-center gap-1.5 px-1.5 py-1.5 text-xs font-medium rounded-lg border sm:px-2.5 border-border bg-background text-text-muted hover:bg-muted hover:text-text-main disabled:opacity-50 transition-colors"
+-        title={t("compatAdjustmentsTitle")}
+-      >
+-        <span className="material-symbols-outlined text-base leading-none">tune</span>
+-        {/* Phones: icon only (the title keeps the label), so a model card fits in two lines. */}
+-        {!compact && <span className="hidden sm:inline">{t("compatButtonLabel")}</span>}
+-      </button>
++      {compact ? (
++        /* Icon-only trailing action, matching the neighbouring visibility/eye button: the
++           label does not fit a model row's right column, so it moves into the tooltip and
++           the accessible name (aria-label) instead of being clipped by the card edge. */
++        <button
++          type="button"
++          onClick={handleToggleOpen}
++          disabled={disabled}
++          className="rounded p-0.5 text-text-muted hover:bg-sidebar hover:text-primary disabled:cursor-not-allowed disabled:opacity-40 transition-colors"
++          aria-label={t("compatButtonLabel")}
++          title={t("compatButtonLabel")}
++        >
++          <span className="material-symbols-outlined text-sm leading-none">tune</span>
++        </button>
++      ) : (
++        <button
++          type="button"
++          onClick={handleToggleOpen}
++          disabled={disabled}
++          className="inline-flex items-center gap-1.5 px-1.5 py-1.5 text-xs font-medium rounded-lg border sm:px-2.5 border-border bg-background text-text-muted hover:bg-muted hover:text-text-main disabled:opacity-50 transition-colors"
++          title={t("compatAdjustmentsTitle")}
++        >
++          <span className="material-symbols-outlined text-base leading-none">tune</span>
++          {/* Phones: icon only (the title keeps the label), so a model card fits in two lines. */}
++          <span className="hidden sm:inline">{t("compatButtonLabel")}</span>
++        </button>
++      )}
+       {open &&
+         typeof document !== "undefined" &&
+         portalPanelRect &&
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/ModelRow.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/ModelRow.tsx
+index e9734133..25aaea1b 100644
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/ModelRow.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/ModelRow.tsx
+@@ -482,6 +482,7 @@ export default function ModelRow({
+               saveModelCompatFlags(model.id, { compatByProtocol: { [protocol]: payload } })
+             }
+             showDeveloperToggle={showDeveloperToggle}
++            compact
+             disabled={compatDisabled}
+           />
+         </div>
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx
+@@ -453,6 +453,10 @@
+               </span>
+             </button>
+           )}
++          {/* Icon-only trailing action: the labelled button is clipped by the card edge in
++              the right column, so `compact` renders the `tune` button exactly like the
++              eye/copy actions beside it and keeps "Compatibility" as its tooltip and
++              aria-label. */}
+           <ModelCompatPopover
+             t={t}
+             providerId={provider}

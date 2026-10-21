@@ -1,0 +1,190 @@
+diff --git a/.env.example b/.env.example
+index b26ec816..9cceb81d 100644
+--- a/.env.example
++++ b/.env.example
+@@ -942,6 +942,13 @@ NEXT_PUBLIC_CLOUD_URL=
+ # an install where no client sends tools, since there is then nothing to learn from.
+ #OPENCODE_FREE_TIER_PLACEHOLDER_TOOLS=glob,grep,read
+ 
++# Anonymous lane key. When set, every request the OpenCode Zen free tier gates carries this
++# value as its key INSTEAD of the connection's own key; paid models and the /zen/go surface
++# keep the connection key. The official client calls the free tier anonymously, so a portal
++# that imported its model list from /models otherwise presents a credential to a tier that
++# has no account behind it (403 FreeTierError / "model not found"). Read per request.
++#OPENCODE_ANONYMOUS_KEY=public
++
+ # Egress-IP lockout scope (#9611). By default the free-tier opencode family
+ # (opencode, opencode-go, opencode-cli) is bucketed by egress IP: one upstream
+ # 429 parks every sibling connection sharing that IP. PAID plans are
+diff --git a/docs/reference/ENVIRONMENT.md b/docs/reference/ENVIRONMENT.md
+index f4521483..643a5113 100644
+--- a/docs/reference/ENVIRONMENT.md
++++ b/docs/reference/ENVIRONMENT.md
+@@ -371,6 +371,7 @@ OmniRoute provides a two-layer defense: request-side injection scanning and resp
+ | `OMNIROUTE_EGRESS_IP_LOCK_PROVIDERS`    | _(unset)_                                                       | `open-sse/config/providerErrorRules.ts`     | Effective set of providers whose upstream failures are bucketed by egress IP (one 429 parks every sibling connection sharing that IP). Unset uses the free-tier default `opencode,opencode-go,opencode-cli`; `none`/`off`/`false`/`0` disables the cascade entirely; a comma-separated list replaces the set. Paid plans are account-bucketed upstream and can safely disable it (#9611).                                       |
+ | `OPENCODE_FREE_TIER_REQUEST_CONTRACT`   | _(unset)_                                                       | `open-sse/executors/opencodeFreeTierContract.ts` | Set to `off` to stop adjusting the body of keyless OpenCode requests (streaming flag and tool list). Headers are still applied. Read per request, so a change takes effect immediately. |
+ | `OPENCODE_FREE_TIER_PLACEHOLDER_TOOLS`  | _(unset)_                                                       | `open-sse/executors/opencodeFreeTierContract.ts` | Comma-separated tool names to declare on a keyless OpenCode request that carries none, when nothing has been observed yet for that model. Empty falls back to a single placeholder the model is told not to call. At most 32 entries, `[A-Za-z_][A-Za-z0-9_-]{0,63}`; invalid entries are ignored. |
++| `OPENCODE_ANONYMOUS_KEY`                | _(unset)_                                                       | `open-sse/executors/opencode.ts`            | When set, replaces the connection's key on requests the OpenCode Zen free tier gates (free models on the `/zen` surface) — the official client calls that tier anonymously, so a keyed connection otherwise gets 403 FreeTierError or "model not found". Paid models, the `/zen/go` surface and `opencode-go` keep the connection key. Read per request. |
+ | `OMNIROUTE_OLLAMA_CLOUD_USAGE_URL`      | `https://ollama.com/settings`                                   | `open-sse/services/usage.ts`                | Ollama Cloud settings URL used for quota scraping. Override for relays / test fixtures.                                                                                                                                                                                                           |
+ | `OMNIROUTE_OLLAMA_CLOUD_BALANCE_URL`    | `https://ollama.com/api/balance`                                | `open-sse/services/ollamaCloudBalance.ts`   | Ollama Cloud documented upstream balance endpoint (`GET https://ollama.com/api/balance`, `Authorization: Bearer <API key>`). Read once at module load. Used first for Ollama Cloud quota when the connection has an API key; the settings-page cookie scraper stays as the fallback. Override for relays / test fixtures. |
+ | `OLLAMA_USAGE_COOKIE`                   | _(unset)_                                                       | `open-sse/services/usage.ts`                | Ollama Cloud `__Secure-session` cookie used for settings-page quota scraping. Sensitive; prefer the per-connection Dashboard field when multiple accounts are configured.                                                                                                                         |
+diff --git a/open-sse/executors/opencode.ts b/open-sse/executors/opencode.ts
+index 0745be01..b2b00e1b 100644
+--- a/open-sse/executors/opencode.ts
++++ b/open-sse/executors/opencode.ts
+@@ -1349,11 +1349,23 @@ export class OpencodeExecutor extends BaseExecutor {
+     const gatedScope =
+       Boolean(model) && isGatedFreeTierRequest(this._surface(), this.provider, model);
+ 
+-    if (key) {
++    // Free-lane parity with 3.8.52: a gated free-tier request is served by the ANONYMOUS
++    // lane, so a configured `OPENCODE_ANONYMOUS_KEY` replaces the connection's key on that
++    // lane only — a keyed connection otherwise presents its own credential to a tier that
++    // authenticates anonymously, which is the 403 (and "model not found") this lane exists
++    // to avoid. Paid models, the `go` surface and opencode-go keep the resolved key, and an
++    // unset/blank env leaves every request byte-identical to upstream. Read per request so
++    // the switch needs no rebuild.
++    const anonymousFreeTierKey = gatedScope
++      ? (process.env.OPENCODE_ANONYMOUS_KEY ?? "").trim()
++      : "";
++    const headerKey = anonymousFreeTierKey || key;
++
++    if (headerKey) {
+       if (this._requestFormat === "claude" || this.usesZenApiKeyAuth()) {
+-        headers["x-api-key"] = key;
++        headers["x-api-key"] = headerKey;
+       } else {
+-        headers["Authorization"] = `Bearer ${key}`;
++        headers["Authorization"] = `Bearer ${headerKey}`;
+       }
+     }
+ 
+diff --git a/open-sse/executors/opencodeFreeTierContract.ts b/open-sse/executors/opencodeFreeTierContract.ts
+index 5b2038ed..1c1bdfa0 100644
+--- a/open-sse/executors/opencodeFreeTierContract.ts
++++ b/open-sse/executors/opencodeFreeTierContract.ts
+@@ -184,22 +184,34 @@ function opencodeFreeModelCatalog(): ReadonlySet<string> | null {
+  * Determine whether a model requires an API key on the given opencode provider.
+  *
+  * - `opencode-go`: ALL models require a key (no free tier).
+- * - `opencode` / `opencode-zen`: premium = any model NOT in the synced free catalog
+- *   (available ∩ free ∧ not deprecated). With no synced catalog, the legacy heuristic
+- *   (`-free` suffix or the registry's known free ids) is used instead.
+- * - Unknown models are assumed premium (fail-safe).
++ * - `opencode` / `opencode-zen`: a KNOWN-FREE id — the `-free` suffix or one of the
++ *   registry's free ids — is free unconditionally. Any other model is premium unless the
++ *   synced free catalog (available ∩ free ∧ not deprecated) lists it. With no synced
++ *   catalog the legacy heuristic decides, and an unknown id stays premium (fail-safe).
++ *
++ * The known-free ids short-circuit the catalog on purpose. The catalog is written by
++ * discovery, so it does not survive an import from `GET /models`: the imported rows carry
++ * no free flag, `catalog.has(id)` is false for every one of them, and a catalog-first
++ * answer turns a model the upstream still serves for free (`big-pickle`, the rotating
++ * `-free` ids) into a paid one — the 402/403 plus "model not found" pair reported against
++ * 3.8.53. A declarative free id is not less true because a snapshot missed it.
+  */
+ export function isPremiumOpencodeModel(model: string, provider: string): boolean {
+   // opencode-go has no free tier — every model requires a key.
+   if (provider === "opencode-go") return true;
+ 
+   const id = model.trim();
++
++  // Declarative free ids beat the catalog, whether or not it is synced.
++  if (id.endsWith("-free") || OPENCODE_LEGACY_FREE_MODELS.has(id)) return false;
++
+   const catalog = opencodeFreeModelCatalog();
+   if (catalog) return !catalog.has(id);
+ 
+-  // Unsynced catalog: the legacy rule, so an unsynced deployment keeps its behavior.
+-  if (id.endsWith("-free")) return false;
+-  return !OPENCODE_LEGACY_FREE_MODELS.has(id);
++  // No synced catalog: the known-free ids returned above, so whatever is left is premium.
++  // (This is the 3.8.52 rule — `!id.endsWith("-free") && !OPENCODE_LEGACY_FREE_MODELS.has(id)`
++  // — with the two legacy-free forms already consumed by the guard, hence the constant.)
++  return true;
+ }
+ 
+ /**
+diff --git a/tests/unit/opencode-free-tier-request-contract.test.ts b/tests/unit/opencode-free-tier-request-contract.test.ts
+index 8d6c3a4b..26b01940 100644
+--- a/tests/unit/opencode-free-tier-request-contract.test.ts
++++ b/tests/unit/opencode-free-tier-request-contract.test.ts
+@@ -96,9 +96,11 @@ test("the contract applies to free-tier models on the gated surface only", () =>
+   assert.equal(requiresFreeTierRequestContract("other", "groq", "big-pickle"), false);
+ });
+ 
+-test("with the synced catalog pinned, only its ids count as free", () => {
+-  // A model the catalog omits is premium even with a `-free` suffix (the upstream
+-  // delisted it — the stale-table failure the catalog rule fixes); a listed id is free.
++test("with the synced catalog pinned, the catalog and the free suffix both grant the contract", () => {
++  // A listed id is free. So is a `-free` id the catalog omits (addon 0005: imported and
++  // rotating free ids are exactly what a synced snapshot can miss, so the suffix is a
++  // declarative free claim and the catalog cannot demote it). An id that makes no free
++  // claim and is not listed stays premium.
+   _setOpencodeFreeModelsForTests(["big-pickle", "nemotron-3.5-lightning-free"]);
+   try {
+     assert.equal(requiresFreeTierRequestContract("zen", "opencode", "big-pickle"), true);
+@@ -106,7 +108,8 @@ test("with the synced catalog pinned, only its ids count as free", () => {
+       requiresFreeTierRequestContract("zen", "opencode", "nemotron-3.5-lightning-free"),
+       true
+     );
+-    assert.equal(requiresFreeTierRequestContract("zen", "opencode", "delisted-model-free"), false);
++    assert.equal(requiresFreeTierRequestContract("zen", "opencode", "delisted-model-free"), true);
++    assert.equal(requiresFreeTierRequestContract("zen", "opencode", "delisted-model"), false);
+   } finally {
+     _setOpencodeFreeModelsForTests(null);
+   }
+@@ -1118,16 +1121,19 @@ test("an opencode-go synced catalog row is not in the free set", async () => {
+       opencode: {
+         "zen-free": { input: 0, output: 0 },
+         "pickle-zen": { input: 0, output: 0 },
+-        "big-pickle": { input: 0, output: 0 },
++        "glm-5.2": { input: 3, output: 15 },
+       },
+     });
+     insert.run("opencode:conn", JSON.stringify([{ id: "zen-free" }]));
+     insert.run("opencode-zen:conn", JSON.stringify([{ id: "pickle-zen" }]));
+-    insert.run("opencode-go:conn", JSON.stringify([{ id: "big-pickle" }]));
++    insert.run("opencode-go:conn", JSON.stringify([{ id: "glm-5.2" }]));
+     _setOpencodeFreeModelsForTests(null);
+     assert.equal(isPremiumOpencodeModel("zen-free", "opencode"), false);
+     assert.equal(isPremiumOpencodeModel("pickle-zen", "opencode-zen"), false);
+-    assert.equal(isPremiumOpencodeModel("big-pickle", "opencode"), true);
++    // The row is synced under opencode-go only, so it never enters the `opencode` family
++    // free set: a paid id stays premium. (The exemplar used to be `big-pickle`, which the
++    // addon's 0005 free-lane rule now classifies free unconditionally — see SOURCES.md.)
++    assert.equal(isPremiumOpencodeModel("glm-5.2", "opencode"), true);
+   } finally {
+     remove.run("opencode:conn", "opencode-zen:conn", "opencode-go:conn");
+     clearModelsDevPricing();
+diff --git a/tests/unit/opencode-premium-keyless-gate-8681.test.ts b/tests/unit/opencode-premium-keyless-gate-8681.test.ts
+index 4ca7710c..781d2c45 100644
+--- a/tests/unit/opencode-premium-keyless-gate-8681.test.ts
++++ b/tests/unit/opencode-premium-keyless-gate-8681.test.ts
+@@ -75,15 +75,22 @@ describe("OpencodeExecutor — premium model keyless gate (#8681)", () => {
+       assert.equal(OpencodeExecutor.isPremiumModel("hy3-free", "opencode-zen"), false);
+     });
+ 
+-    it("treats an unlisted free-suffixed model as premium when the catalog omits it", () => {
+-      // No suffix rule anymore: a `-free` id absent from the synced catalog is premium
+-      // (the upstream delisted it — the failure the old static table caused).
++    it("keeps an unlisted `-free` id free when the catalog omits it", () => {
++      // The suffix is a declarative free claim (3.8.52 parity, addon 0005): imported and
++      // rotating free ids are exactly the ones a synced snapshot can miss, so the catalog
++      // must not be able to demote them into the keyed lane.
+       assert.equal(
+         OpencodeExecutor.isPremiumModel("some-delisted-model-free", "opencode-zen"),
+-        true
++        false
+       );
+     });
+ 
++    it("treats an unlisted, unsuffixed, non-legacy id as premium", () => {
++      // Nothing about the id claims to be free and the catalog does not list it — the
++      // fail-safe answer is premium.
++      assert.equal(OpencodeExecutor.isPremiumModel("some-delisted-model", "opencode-zen"), true);
++    });
++
+     it("returns true for premium models on opencode-zen", () => {
+       assert.equal(OpencodeExecutor.isPremiumModel("gpt-5", "opencode-zen"), true);
+       assert.equal(OpencodeExecutor.isPremiumModel("gpt-5-nano", "opencode-zen"), true);

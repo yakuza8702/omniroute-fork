@@ -9,15 +9,22 @@
  * `quotaPanelSupported` gate.
  *
  * The first paint asks the pool endpoint for `detail=fast`, which is a snapshot read with **no
- * upstream traffic** — a page with ten connections costs zero billing calls. Clicking the refresh
- * action repeats the same request with `refresh=1`, which is the explicit "re-read the billing
- * endpoint" path. An empty snapshot is rendered as `unknown`, never as a zero balance: a
- * fabricated `0` would read as "out of credits".
+ * upstream traffic** — a page with ten connections costs zero billing calls. When that snapshot
+ * has no verdict yet (`pending: true`, or an account whose status is `unknown`), the badge
+ * promotes ITSELF once per connection to a full probe (the same request without `detail=fast`)
+ * and renders that answer: a fast-only card would sit at "Credits unknown" forever, because
+ * nothing else on the page warms the snapshot. The promotion is memoized per connection and
+ * guarded by an in-flight flag, so a re-render or a double effect cannot loop it.
+ *
+ * Clicking the refresh action asks for the full probe directly with `refresh=1`, which is the
+ * explicit "re-read the billing endpoint" path. An empty snapshot is rendered as `unknown`, never
+ * as a zero balance: a fabricated `0` would read as "out of credits".
  *
  * Figures are wire-shaped by `GET /api/workbuddy/credits` (`src/app/api/workbuddy/credits/route.ts`).
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { needsWorkBuddyFullCreditProbe } from "@/shared/utils/workBuddyCreditProbe";
 
 interface PoolAccountRow {
   cid: string | null;
@@ -106,18 +113,25 @@ function toView(body: CreditsResponse, connectionId: string | null): View {
 export function WorkBuddyPoolCreditBadge({ connectionId }: WorkBuddyPoolCreditBadgeProps) {
   const [view, setView] = useState<View>({ kind: "loading" });
   const [refreshing, setRefreshing] = useState(false);
+  // One promotion per connection: a fast body that stays pending (a snapshot write that lags,
+  // a probe that failed) must not re-fire the full read on every render.
+  const promotedFor = useRef<string | null>(null);
+  // Mount-loop guard: two overlapping `load` calls would each promote, and the effect that
+  // seeds the first paint re-runs whenever the `load` callback changes identity.
+  const inFlight = useRef(false);
 
-  const load = useCallback(
-    async (refresh: boolean) => {
-      if (!connectionId) {
-        setView({ kind: "unknown", reason: "empty" });
-        return;
-      }
-      const params = new URLSearchParams({
-        all: "true",
-        detail: "fast",
-        connectionId,
-      });
+  /**
+   * One request against the credits route.
+   *
+   * `detail: "fast"` is the snapshot-only read and never reaches the billing endpoint; any
+   * other value is the full probe the route serves by default. Returns `null` when the request
+   * could not produce a body — the view is already set in that case.
+   */
+  const request = useCallback(
+    async (detail: "fast" | "full", refresh: boolean): Promise<CreditsResponse | null> => {
+      if (!connectionId) return null;
+      const params = new URLSearchParams({ all: "true", connectionId });
+      if (detail === "fast") params.set("detail", "fast");
       if (refresh) params.set("refresh", "1");
       try {
         const response = await fetch(`/api/workbuddy/credits?${params.toString()}`, {
@@ -129,15 +143,48 @@ export function WorkBuddyPoolCreditBadge({ connectionId }: WorkBuddyPoolCreditBa
             message:
               response.status === 404 ? "No WorkBuddy connection." : "Could not read credits.",
           });
-          return;
+          return null;
         }
-        const body = (await response.json()) as CreditsResponse;
-        setView(toView(body, connectionId));
+        return (await response.json()) as CreditsResponse;
       } catch {
         setView({ kind: "error", message: "Could not read credits." });
+        return null;
       }
     },
     [connectionId]
+  );
+
+  const load = useCallback(
+    async (refresh: boolean) => {
+      if (!connectionId) {
+        setView({ kind: "unknown", reason: "empty" });
+        return;
+      }
+      if (inFlight.current) return;
+      inFlight.current = true;
+      try {
+        // The explicit refresh is a full read by definition: `detail=fast` never fetches, so
+        // reusing it here would turn the button into a no-op.
+        if (refresh) {
+          const full = await request("full", true);
+          if (full !== null) setView(toView(full, connectionId));
+          return;
+        }
+
+        const fast = await request("fast", false);
+        if (fast === null) return;
+        let body = fast;
+        if (needsWorkBuddyFullCreditProbe(fast) && promotedFor.current !== connectionId) {
+          promotedFor.current = connectionId;
+          const full = await request("full", false);
+          if (full !== null) body = full;
+        }
+        setView(toView(body, connectionId));
+      } finally {
+        inFlight.current = false;
+      }
+    },
+    [connectionId, request]
   );
 
   useEffect(() => {

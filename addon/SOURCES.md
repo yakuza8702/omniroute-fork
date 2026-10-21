@@ -33,13 +33,16 @@ Citation convention: `path:lines` is relative to the overlay target (the upstrea
 | `src/app/api/workbuddy/credits/route.ts:1-302` | `src/app/api/workbuddy/credits/route.ts` | Same query surface (`?all`, `?detail=fast`, `?refresh`, `?connectionId`), served through the pool engine so the single-account read shares the snapshot. |
 | `src/app/api/workbuddy/info/route.ts:1-55` | `src/app/api/workbuddy/info/route.ts` | `describeWorkBuddyAddon()` + a network-free connection count; the deferred routes are absent from the route table. |
 | `.../components/WorkBuddyCreditBadge.tsx:1-64` | `.../components/WorkBuddyCreditBadge.tsx` | Verbatim. Renders nothing unless the provider is this addon's AND a rate is declared. |
-| — (new) | `.../components/WorkBuddyPoolCreditBadge.tsx` | Plan §C4 badge: first paint is `?all=true&detail=fast` (snapshot only, zero upstream calls), the refresh action repeats with `?refresh=1`, `unknown` is never rendered as `0`. |
+| — (new) | `.../components/WorkBuddyPoolCreditBadge.tsx` | Plan §C4 badge: first paint is `?all=true&detail=fast` (snapshot only, zero upstream calls), the refresh action asks for the full probe with `?refresh=1`, `unknown` is never rendered as `0`. **Wave 4:** when that fast body has no verdict (`pending`, or any account `unknown`), the badge promotes itself ONCE per connection to the full probe (`?all=true&connectionId=…`, no `detail=fast`) and renders that answer — the connection card showed "Credits unknown" because nothing on the page ever asked for the full read the route already serves. The promotion is memoized per connection and guarded by an in-flight ref, so a double effect or a re-render cannot loop it. |
 | — (new) | `.../components/WorkBuddyReasoningEffortEditor.tsx` | Plan §6 effort editor: draft seeded on OPEN (no setState-in-effect), six-level vocabulary, Save → PATCH, Clear → DELETE. |
 | — (new) | `.../hooks/useModelContextOverrides.ts` | The `CompatibleModelsSection` read/save pair lifted into a hook for the passthrough section (plan §6). |
 | — | `tests/unit/workbuddy-credit.test.ts` | New (plan §9 T1): tier, caption, declared-rate reader and the id gate. |
 | — | `tests/unit/workbuddy-pool-quota.test.ts` | New (plan §9 T6): TTL reuse, `detail=fast` never fetches, `refresh` bypass, `allSettled` isolation of a dead token, exclusions, single-connection scoping, account selection. |
 | — | `tests/unit/workbuddy-catalog-projection.test.ts` | New (plan §9 T7): `toDiscoveryCatalogModel` carries `creditMultiplier`/`isFree`, omits both when there is no claim, and leaves the pre-existing projection byte-identical. |
 | — | `tests/unit/workbuddy-reasoning.test.ts` | New (plan §9 T5). Twelve cases: the pure ladder rule (strip / clamp up / off→`none` / off→floor / unknown word / `thinking` never forwarded), the override-first contract (B2, incl. the bulk-map path and connection-scoped row precedence), the single-edition id mapping, and B3/B4 wiring (both map keys resolve to `WorkBuddyExecutor`; the wire body is clamped end-to-end; the D9 gate leaves the body untouched). |
+| — (new) | `src/shared/utils/workBuddyCreditProbe.ts` | **Wave 4 (§C4 follow-up).** The badge's promotion rule as a pure predicate: `needsWorkBuddyFullCreditProbe(body)` is true when any edition reports `pending` or any account's `status` is `unknown` (or absent), and false for `ok`/`error`/`excluded`, an edition with no rows, and an empty body. Client-safe (no env, no DB), so the component and T8 share one source of truth instead of an inline condition the test would have to restate. |
+| — | `tests/unit/workbuddy-pool-badge.test.ts` | New (wave 4, T8): the promotion predicate — promotes on `pending: 1`, on any `unknown` row, on a status-less row and on a later edition; does **not** promote on `ok`/`error`/`excluded`, on an edition with no rows, or on an empty/absent body (those would be billing-call loops, not display fixes). |
+| — | `tests/unit/workbuddy-opencode-premium.test.ts` | New (wave 4, `0005`): the free-lane rule at source level — the `-free` suffix and the legacy free ids stay free under a catalog that omits them, the catalog still decides for ids that make no free claim, an unknown id is premium with no synced catalog, and `opencode-go` stays fully keyed; plus the anonymous-key header contract (gated free request → env key; paid model, `/zen/go` surface and blank env → connection key; no credential and no env → no `Authorization`; zen Responses surface → `x-api-key`). |
 
 Tests live under `addon/files/tests/unit/` on purpose: `overlay.sh` copies them into the
 checkout's `tests/unit/`, which is the only location the repo's harness globs
@@ -88,6 +91,47 @@ compiled or run.
 | `.../components/PassthroughModelsSection.tsx` (state after `:148`; JSX `:452-512`) | Threads `contextWindowOverride` + `onSaveContextWindowOverride` + `savingContextOverride` (via the new `useModelContextOverrides` hook), `supportsVision` + `onSaveSupportsVision`, and the WorkBuddy-only effort props (`reasoningEfforts`, `onSaveReasoningEfforts`, `onClearReasoningEfforts`, `savingReasoningEfforts`). Loads ctx/vision from `GET /api/provider-models?provider=` and efforts from `GET /api/model-capability-overrides` (client-side filter by `${providerId}/` prefix). | plan §6; no fork equivalent (the fork predates the upstream override APIs) |
 | `.../components/PassthroughModelRow.tsx` | New optional props: `onSaveSupportsVision`/`savingVision` render a small eye toggle next to the vision badge, and `onSaveReasoningEfforts`/`onClearReasoningEfforts`/`reasoningEfforts`/`savingReasoningEfforts` mount `WorkBuddyReasoningEffortEditor`. Absent handlers leave the row unchanged, so compat callers behave exactly as before. | plan §6 |
 | `addon/overlay.sh` (governance) | Eight post-condition markers added for 0003/0004 (credit helper, discovery mapping, pool probe, credits route, the ConnectionRow badge, the effort vocabulary, the section's effort wiring, the row's vision toggle) — 24 → 32 assertions. | plan §2 |
+
+## Modified files (`addon/patches/0005-opencode-free-lane.patch` — wave 4, opencode free lane)
+
+The plan (§2) has named `0005-opencode-free-lane.patch` since wave 1 but never shipped it: waves
+1–3 shipped `0001`–`0004`, so the source image inherited 3.8.53's **catalog-first**
+`isPremiumOpencodeModel` and lost the keyed-lane override that the prebuilt 3.8.52 image carried
+as a `Dockerfile` splice (patch-spec §8, deployed as `l&&(a=(process.env.OPENCODE_ANONYMOUS_KEY||"").trim()||a)`).
+Two user-verified symptoms follow from that: an OpenCode Zen free request 403s after an
+"Import from `/models`" (the imported rows carry no free flag, so `catalog.has(id)` is false and
+`big-pickle` is classified premium), and `big-pickle` reports "model not found" (the request goes
+out on the keyed lane instead of the anonymous one). `0005` restores both as source hunks.
+
+| Upstream anchor | Change | Origin |
+|---|---|---|
+| `open-sse/executors/opencodeFreeTierContract.ts:192-203` (`isPremiumOpencodeModel`) | Insert the known-free guard **before** the catalog return: `if (id.endsWith("-free") \|\| OPENCODE_LEGACY_FREE_MODELS.has(id)) return false;`, then `if (catalog) return !catalog.has(id);`, then the legacy fallback (which is now reached only for ids that made no free claim, i.e. premium). This is the 3.8.52 C1 semantics (`r.endsWith("-free") \|\| E.has(r) ? false : n ? !n.has(r) : …`, patch-spec §10.3) expressed in source. `opencode-go` still returns `true` before any of it. The doc-comment records why: discovery writes the catalog, an import from `GET /models` does not preserve the free flag, and a declarative free id must not be demoted by a snapshot that missed it. | patch-spec §10.2/§10.3 (C1); bug 1 of the wave-4 brief |
+| `open-sse/executors/opencode.ts:1349-1358` (`buildHeaders`) | After `const key = resolveEffectiveKey(...) \|\| credentials.accessToken`, compute `gatedScope` (already there), then `const anonymousFreeTierKey = gatedScope ? (process.env.OPENCODE_ANONYMOUS_KEY ?? "").trim() : "";` and emit `headerKey = anonymousFreeTierKey \|\| key` in place of `key`. So a configured anonymous key REPLACES the connection key on gated requests only; paid models, the `go` surface and `opencode-go` keep the resolved key, and an unset/blank env is byte-identical to upstream. The env is read per request (lazy), so the lane can be flipped without a rebuild. | patch-spec §8 (v2 deployed semantics); bug 1 of the wave-4 brief |
+| `.env.example:938-950` | Documents `OPENCODE_ANONYMOUS_KEY=public` next to the other free-tier knobs (commented, empty by default). Not decoration: `scripts/check/check-env-doc-sync.mjs` fails the join when a `process.env.X` reference has no `.env.example` + `ENVIRONMENT.md` row. | this port (fork-only knob) |
+| `docs/reference/ENVIRONMENT.md:373-374` | One row for the same variable (default `_(unset)_`, source `open-sse/executors/opencode.ts`, gated-requests-only scope). | this port |
+| `tests/unit/opencode-premium-keyless-gate-8681.test.ts:78-86` | The case that pinned "an unlisted `-free` id is premium when the catalog omits it" is **inverted by the fix**: the suffix is a free claim again. It now asserts `false` for the suffix, and a new case keeps the fail-safe for an unlisted id that makes no free claim (`some-delisted-model` → `true`). Leaving the old assertion would have made the suite red for the exact change requested (same class of adjustment as 0001's catalogue pin and 0002's golden snapshot). | consequence of the classify rule |
+| `tests/unit/opencode-free-tier-request-contract.test.ts:1117-1133` | The "an `opencode-go` synced row is not in the `opencode` family free set" case used `big-pickle` as its exemplar; `big-pickle` is a known-free id now, so it would pass for the wrong reason. The exemplar is a paid id (`glm-5.2`, priced in the fixture), and the intent — a row synced under `opencode-go` never enters the `opencode` free set — is unchanged. | consequence of the classify rule |
+
+**Not replicated: `OPENCODE_FREE_TIER_MODEL_BLOCKLIST` (patch-spec §3.4).** That knob made a
+blocked id *never* free (a keyed 402 instead of an upstream 403) and was an operator escape hatch
+for a roster 3.8.53 had not caught up with. With known-free ids unconditionally free and the
+anonymous key on the gated lane, a blocklist entry would only resurrect the 403 it used to
+prevent, so it is deliberately absent from `0005` — see deviation 14.
+
+## Modified files (`addon/patches/0006-workbuddy-compact-ui.patch` — wave 4, model-row action)
+
+`Compatibility` was the only trailing label button on a model row: `inline-flex … gap-1.5 px-1.5
+py-1.5 border … sm:px-2.5` plus a `hidden sm:inline` label. On the right-column model cards it
+overflows the card edge and is clipped. The row's neighbouring actions (copy, test, eye) are all
+icon-only (`rounded p-0.5 text-sm`) with the wording in `title`; the Compatibility action now
+matches them. No other button changes.
+
+| Upstream anchor | Change | Origin |
+|---|---|---|
+| `.../components/ModelCompatPopover.tsx:526-537` | The trigger is split: `compact` renders the icon-only pattern — `rounded p-0.5 text-text-muted hover:bg-sidebar hover:text-primary`, `material-symbols-outlined text-sm` `tune`, with `aria-label`/`title` = `t("compatButtonLabel")` ("Compatibility") so the affordance keeps its name for screen readers and hover. The non-compact branch is the previous button, byte-for-byte (custom-model rows keep the label). The `compact` prop's doc-comment now states that it is the model-row form, not a phone-only nicety. | bug 3 of the wave-4 brief |
+| `.../components/ModelRow.tsx:484-486` | Passes `compact` to its `ModelCompatPopover`. Managed rows are the right-column cards the clip was reported on; `PassthroughModelRow` already passed it, so the shared trigger fixes both paths at the source instead of duplicating markup per row. | bug 3 of the wave-4 brief |
+| `.../components/PassthroughModelRow.tsx:456` | Comment only (no markup change): the call site states that `compact` is the icon-only form and why, because the row renders the shared trigger and a future refactor of the popover must not reintroduce the label here. The passthrough and compatible sections both flow through this row (`CompatibleModelsSection.tsx:566-607` renders `PassthroughModelRow`), so one shared trigger covers them. | bug 3 of the wave-4 brief |
+| `addon/overlay.sh` (governance) | Four markers added for wave 4 (the two `0005` anchors, the badge's promoted call, the icon-only `aria-label`) — 32 → 36 assertions. | plan §2 |
 
 ### Deliberate deviations from the plan text (reported, not silent)
 
@@ -214,6 +258,54 @@ compiled or run.
     from the diagnosis (`auth_rejected` ⇒ false); a dead token therefore answers `connected: false`
     with `diagnosis: "auth_rejected"` instead of the fork's earlier "connected but failed" body.
 
+**Wave 4:**
+
+22. **No `OPENCODE_FREE_TIER_MODEL_BLOCKLIST` patch.** Patch-spec §3.4 shipped a shifted,
+    de-duplicated id list that classified a blocked id as **never free**, converting the upstream
+    403 into the gateway's clean 402. The brief for this wave explicitly excludes it, and the code
+    agrees: with the known-free rule restored and the anonymous key on the gated lane, the only
+    thing a blocklist can still do is send a free id back down the keyed lane — the failure this
+    patch removes. The opt-out `OPENCODE_FREE_TIER_REQUEST_CONTRACT=off` is untouched.
+23. **Two pre-existing opencode assertions move with the rule.** `0005` inverts
+    `opencode-premium-keyless-gate-8681.test.ts`'s "unlisted `-free` id is premium" case (the rule
+    the fix restores is exactly what it denied) and swaps the `big-pickle` exemplar in
+    `opencode-free-tier-request-contract.test.ts` for a paid id, because `big-pickle` is a
+    known-free id now and would make that case pass for the wrong reason. Neither test was weakened:
+    each keeps an explicit negative case for the fail-safe it existed to protect (unknown id with
+    no free claim → premium; a row synced under `opencode-go` never enters the `opencode` set).
+24. **The env knob is documented in `.env.example` + `ENVIRONMENT.md`.** Not in the brief, but
+    `scripts/check/check-env-doc-sync.mjs` reads every `process.env.X` in `src/`/`open-sse/` and
+    fails when the var is missing from both files — adding the reference without the docs would
+    have turned a source port into a red docs gate. Verified: `✓ Env / docs contract is in sync.`
+25. **The free-lane rule lives in `isPremiumOpencodeModel`, not in the executor gate.**
+    `isGatedFreeTierRequest` already delegates to it, and `buildUrl` (the `/inference/v1` base) and
+    `prepareFreeTierRequest` (the body contract) both reuse the same predicate — so one edit moves
+    the classification, the URL, the header synthesis and the body contract together. Patching the
+    two call sites instead would leave them able to disagree.
+26. **The badge promotes ONCE per connection, and refresh is a full read.** A `detail=fast` body
+    that stays `pending` cannot be allowed to re-fire a billing read on every render, so the
+    promotion is memoized by connection id and the `load` call is guarded by an in-flight ref.
+    The refresh button therefore asks for `full + refresh=1` directly rather than "fast with
+    refresh", which is a snapshot read that ignores `refresh` and would have made the button a
+    no-op after the first promotion. Rendering semantics are unchanged: an absent verdict is
+    still `unknown`, never `0`.
+27. **The promotion rule is a separate copied module, not an inline condition.** `WorkBuddyPoolCreditBadge.tsx`
+    is a `"use client"` `.tsx` file, and the repo's unit harness (`node --test` + `tsx`) does not
+    render components; an inline predicate would have been untestable without a vitest/DOM
+    harness. `src/shared/utils/workBuddyCreditProbe.ts` is pure and client-safe, so T8 pins the
+    decision and the component only wires the fetch to it.
+28. **The Compatibility action is fixed in `ModelCompatPopover`, and `ModelRow` opts in.**
+    `PassthroughModelRow` (passthrough + compatible sections) already passed `compact`, so the
+    clipping row was the managed `ModelRow`, which rendered the labeled form; the passthrough
+    call site therefore gets a comment, not markup. Changing the shared trigger and passing
+    `compact` from `ModelRow` fixes both paths once; `CustomModelsSection` (custom rows, not in
+    the reported right column) keeps the labeled button untouched, as asked ("no other buttons
+    changed").
+29. **The icon-only button keeps its accessible name.** "Icon-only" is a visual statement; the
+    affordance is still named `Compatibility` through `aria-label` + `title`, mirroring the
+    neighbouring eye/copy/test buttons, so the remedy does not trade a layout bug for an
+    accessibility one.
+
 ## DEFERRED (plan §12 — explicitly out of this port)
 
 * **CN edition + `workbuddy-global` provider id.** Needs a *new* id, not a rename: `workbuddy`
@@ -304,3 +396,29 @@ repository for wave 2.
 The 96-test run borrowed the fork checkout's `node_modules` via a symlink and pointed `TMPDIR` at
 `/workspace/.tmp_wave3` (the host `/tmp` is a 2 GB tmpfs and was full), exactly as waves 1–2 did.
 No commit was made in this repository for wave 3.
+
+## Verification performed for wave 4 (not a promise — the transcript is in the hand-off)
+
+Fresh oracle tree: `/workspace/pkgtest_scratch12` = `rsync -a --exclude=.git --exclude=node_modules`
+of the upstream checkout @ `e9cb075c`, then `git init` + one commit (`106065a`). Every number
+below was produced against a tree built from that commit, not against an incrementally patched
+one.
+
+| Check | Command | Result |
+|---|---|---|
+| Full series applies | `bash addon/overlay.sh /workspace/pkgtest_scratch12` | `overlay: copied 29 file(s)`, `overlay: preflight passed for 6 patch(es)`, `overlay: applied 0001…0006`, **36 post-condition assertions passed**, `overlay ok — 6 patch(es), 29 file(s)`, exit 0 |
+| Fail-closed | same command a second time | `overlay: ERROR — work tree has changes relative to HEAD in /workspace/pkgtest_scratch12 … nothing was applied`, exit **1** |
+| Unit tests (T1–T8 + pre-existing + golden) | `TMPDIR=/workspace/.tmp_wave4 node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts --test tests/unit/workbuddy-*.test.ts tests/unit/executor-map-golden.test.ts tests/unit/executor-registry.test.ts` | **116/116 pass**, exit 0 (96 from waves 1–3 + **20 new**: 13 in `workbuddy-opencode-premium.test.ts`, 7 in `workbuddy-pool-badge.test.ts`) |
+| opencode regression sweep (the files `0005` touches and their neighbours) | `… --test tests/unit/opencode-*.test.ts tests/unit/refactor-buildHeaders-{opencode,preamble}.test.ts tests/unit/refactor-opencodeHeaders.test.ts tests/unit/opencodeReasoningSanitizer.test.ts` | **982/982 pass**, exit 0 — includes the two edited suites (`opencode-free-tier-request-contract` 73 with the premium gate file, `opencode-premium-keyless-gate-8681`) and `refactor-buildHeaders-opencode` (the `resolveEffectiveKey` guard still matches) |
+| Core typecheck gate | `npm run typecheck:core` | exit 0, no diagnostics |
+| open-sse typecheck gate (CI-real) | `node scripts/check/check-open-sse-typecheck.mjs` | `openSseTypecheckErrors=0`, `OK — 0 pre-existing error(s), all within frozen baseline`, exit 0 |
+| Dashboard typecheck gate | `npm run check:dashboard-typecheck` | `OK — 196 pre-existing error(s), all within frozen baseline`, exit 0 — the frozen count is unchanged, so the patched components add no diagnostic |
+| Format | `prettier --check` (repo config) over all 11 touched files | clean (`docs/reference/ENVIRONMENT.md` is in `.prettierignore`; `.env.example` is not a Prettier target) |
+| Lint | `eslint` over the same 11 files | 2 errors, both **pre-existing** in `open-sse/executors/opencode.ts` (`@typescript-eslint/no-explicit-any` at the file's `any` pair): verified by linting `git show HEAD:open-sse/executors/opencode.ts` in place — the pristine copy reports the same 2 errors at `:1473`/`:1476`, i.e. the same statements, shifted 9 lines by this patch |
+| Env/doc contract | `node scripts/check/check-env-doc-sync.mjs` on the overlaid tree | `OPENCODE_ANONYMOUS_KEY` is in sync (code + `.env.example` + `ENVIRONMENT.md`). The gate still reports **2 pre-existing addon debts from waves 1/3** — `WORKBUDDY_ADDON` (`src/lib/workbuddy/types.ts`) and `WORKBUDDY_POOL_STATE` (`src/lib/workbuddy/poolState.ts`) — which predate this wave and belong to no `0005`/`0006` hunk; recorded here rather than smuggled into an unrelated patch |
+| Revalidation after the last hunk | `0006` gained a comment-only hunk in `PassthroughModelRow.tsx` after the first green run, so the whole cycle was repeated on a reset tree: overlay exit 0 with the same `29 file(s)` / `36 assertions`, both test groups re-run (**116/116**, **982/982**), `prettier`/`eslint`/`typecheck:core`/`check:open-sse-typecheck`/`check:dashboard-typecheck` all re-run green on that exact tree | the numbers in this table are the post-revalidation ones |
+| Isolation of the fix | the two new suites run without the DB seam | `workbuddy-pool-badge.test.ts` needs no fixtures (pure predicate); `workbuddy-opencode-premium.test.ts` pins the catalog through `_setOpencodeFreeModelsForTests` and restores it, and the anonymous-key cases set/unset `process.env.OPENCODE_ANONYMOUS_KEY` in `afterEach` |
+
+The 116- and 982-test runs borrowed the fork checkout's `node_modules` via a symlink and pointed
+`TMPDIR` at `/workspace/.tmp_wave4`, exactly as waves 1–3 did. No commit was made in this
+repository for wave 4.

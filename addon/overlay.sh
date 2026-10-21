@@ -165,6 +165,28 @@ const markers = [
     "src/app/(dashboard)/dashboard/providers/[id]/components/PassthroughModelRow.tsx",
     "Toggle vision capability override",
   ],
+  // 0005 — the opencode free lane. One marker per half: the premium classify (known-free ids
+  // short-circuit the synced catalog) and the anonymous key that replaces the connection key on
+  // a gated free request. Both are single-source-level facts; either missing means the 403
+  // regression is back, which no type check can see.
+  [
+    "open-sse/executors/opencodeFreeTierContract.ts",
+    "if (id.endsWith(\"-free\") || OPENCODE_LEGACY_FREE_MODELS.has(id)) return false;",
+  ],
+  ["open-sse/executors/opencode.ts", "const anonymousFreeTierKey = gatedScope"],
+  // Wave 4 — the credit badge promotes itself to ONE full probe when the fast snapshot has no
+  // verdict. The marker is the promoted call, not the helper export: a badge that imports the
+  // rule but never runs it is exactly the "Credits unknown" bug.
+  [
+    "src/app/(dashboard)/dashboard/providers/[id]/components/WorkBuddyPoolCreditBadge.tsx",
+    "needsWorkBuddyFullCreditProbe(fast)",
+  ],
+  // 0006 — the Compatibility action is icon-only on the model rows, with the label kept as the
+  // accessible name (the neighbouring eye-button pattern). No label text ⇒ nothing to clip.
+  [
+    "src/app/(dashboard)/dashboard/providers/[id]/components/ModelCompatPopover.tsx",
+    "aria-label={t(\"compatButtonLabel\")}",
+  ],
 ];
 
 let missing = 0;
