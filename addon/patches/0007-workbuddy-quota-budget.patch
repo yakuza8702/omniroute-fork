@@ -1,0 +1,164 @@
+diff --git a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCard.tsx b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCard.tsx
+index 2a119270..b67e9dc2 100644
+--- a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCard.tsx
++++ b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCard.tsx
+@@ -1,5 +1,6 @@
+ "use client";
+ 
++import type { ReactNode } from "react";
+ import { useMemo, useState } from "react";
+ import Card from "@/shared/components/Card";
+ import {
+@@ -65,6 +66,12 @@ interface QuotaCardProps {
+   quotaVisibility?: Record<string, { hidden?: string[] }>;
+   onHideQuota?: (quota: any) => void;
+   onShowQuota?: (quota: any) => void;
++  /**
++   * Credits constraint slot (wave 5). Rendered under the expanded quota body, after every
++   * gauge/row the provider reported: for a WorkBuddy connection the quota list is empty
++   * (`USAGE_SUPPORTED_PROVIDERS` omits the provider), so this is the card's only meter.
++   */
++  creditsSlot?: ReactNode;
+ }
+ 
+ export default function QuotaCard({
+@@ -85,6 +92,7 @@ export default function QuotaCard({
+   quotaVisibility,
+   onHideQuota,
+   onShowQuota,
++  creditsSlot,
+ }: QuotaCardProps) {
+   const isActive = connection.isActive ?? true;
+   const [costModalOpen, setCostModalOpen] = useState(false);
+@@ -189,6 +197,11 @@ export default function QuotaCard({
+         redeemingResetCredit={redeemingResetCredit}
+         loadingResetCredits={loadingResetCredits}
+       />
++      {creditsSlot ? (
++        /* Credits constraint: the pooled WorkBuddy credit meter replaces the gauge list this
++           card cannot fill. Separated by the same hairline the card uses between sections. */
++        <div className="border-t border-border/40 px-3 py-2">{creditsSlot}</div>
++      ) : null}
+       <ProviderUsdCostModal
+         isOpen={costModalOpen}
+         onClose={() => setCostModalOpen(false)}
+diff --git a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCardGrid.tsx b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCardGrid.tsx
+index e964623b..a37a33cf 100644
+--- a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCardGrid.tsx
++++ b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCardGrid.tsx
+@@ -21,6 +21,14 @@ interface Props {
+   emailsVisible: boolean;
+   providerLabels: Record<string, string>;
+   renderInlineQuotaSummary?: (quota: any) => ReactNode;
++  /**
++   * Credits constraint slot (wave 5). Rendered under the card's quota rows, which is where a
++   * WorkBuddy card keeps its only meter: the provider is absent from
++   * `USAGE_SUPPORTED_PROVIDERS`, so it has no quota gauges to draw. The grid never inspects the
++   * node — the caller decides per connection (`workBuddyCreditsForDisplay`) and the connection
++   * shape stays whatever the bundled dashboard passes in.
++   */
++  renderCreditsSlot?: (connection: any) => ReactNode;
+   onRefresh: (id: string, provider: string) => void;
+   onOpenCutoff: (connection: any) => void;
+   onOpenResetCredits?: (id: string, provider: string) => void;
+@@ -165,6 +173,7 @@ function ProviderQuotaSection({
+   quotaVisibility,
+   onHideQuota,
+   onShowQuota,
++  renderCreditsSlot,
+ }: ProviderQuotaSectionProps) {
+   const [open, setOpen] = useState(defaultOpen);
+   const activeCount = connections.filter((conn) => conn.isActive ?? true).length;
+@@ -220,6 +229,7 @@ function ProviderQuotaSection({
+                   ? (q) => onShowQuota({ connectionId: conn.id, provider: conn.provider }, q)
+                   : undefined
+               }
++              creditsSlot={renderCreditsSlot ? renderCreditsSlot(conn) : undefined}
+             />
+           ))}
+         </div>
+@@ -237,6 +247,7 @@ export default function QuotaCardGrid({
+   emailsVisible,
+   providerLabels,
+   renderInlineQuotaSummary: _renderInlineQuotaSummary,
++  renderCreditsSlot,
+   onRefresh,
+   onOpenCutoff,
+   onOpenResetCredits,
+@@ -279,6 +290,7 @@ export default function QuotaCardGrid({
+           ? (q) => onShowQuota({ connectionId: conn.id, provider: conn.provider }, q)
+           : undefined
+       }
++      creditsSlot={renderCreditsSlot ? renderCreditsSlot(conn) : undefined}
+     />
+   );
+ 
+@@ -318,6 +330,7 @@ export default function QuotaCardGrid({
+           quotaVisibility={quotaVisibility}
+           onHideQuota={onHideQuota}
+           onShowQuota={onShowQuota}
++          renderCreditsSlot={renderCreditsSlot}
+           redeemingResetCreditId={redeemingResetCreditId}
+           loadingResetCreditsId={loadingResetCreditsId}
+           defaultOpen
+diff --git a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx
+index 7ca59c2a..9f293a59 100644
+--- a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx
++++ b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx
+@@ -36,6 +36,8 @@ import { formatAutoRefreshCountdown } from "./formatters";
+ import { translateUsageOrFallback, type UsageTranslationValues } from "./i18nFallback";
+ import { compareTr } from "@/shared/utils/turkishText";
+ import { fetchWithTimeout } from "@/shared/utils/fetchTimeout";
++import { workBuddyCreditsForDisplay } from "@/shared/utils/workBuddyCredit";
++import { WorkBuddyPoolCreditBadge } from "@/app/(dashboard)/dashboard/providers/[id]/components/WorkBuddyPoolCreditBadge";
+ 
+ // Bound the two first-paint requests so a stalled connection cannot wedge
+ // `initialLoading` on `true` and freeze the quota page on its skeleton forever
+@@ -453,6 +455,10 @@ export default function ProviderLimits({
+ 
+   const refreshProvider = useCallback(
+     async (connectionId: string, provider: string) => {
++      // WorkBuddy has no provider-usage implementation, so a quota refresh for it can only
++      // produce an error line beside the credits strip. The strip owns its own refresh
++      // (`?refresh=1` on the pool route), so the card's refresh action is a no-op for it.
++      if (workBuddyCreditsForDisplay({ provider, id: connectionId }) !== null) return;
+       await fetchQuota(connectionId, provider, { force: true });
+     },
+     [fetchQuota]
+@@ -528,12 +534,18 @@ export default function ProviderLimits({
+     });
+   }, [applyCachedQuotaState, fetchCachedProviderLimits, fetchConnections]);
+ 
++  // WorkBuddy is absent from `USAGE_SUPPORTED_PROVIDERS`, so `supportsProviderQuota()` is false
++  // for it and the panel used to drop the connection entirely (plan §C4 — no card, no credits).
++  // It has no quota windows to draw: the credit meter IS the quota, and the card below renders
++  // the badge for it. Membership is therefore "quota-supported, or has a credits line to show",
++  // decided by the same predicate that supplies the badge's `connectionId`.
+   const filteredConnections = useMemo(
+     () =>
+       connections.filter(
+         (conn) =>
+           isProviderQuotaVisible(conn) &&
+-          supportsProviderQuota(conn.provider, conn) &&
++          (supportsProviderQuota(conn.provider, conn) ||
++            workBuddyCreditsForDisplay(conn) !== null) &&
+           (conn.authType === "oauth" || conn.authType === "apikey")
+       ),
+     [connections]
+@@ -1089,6 +1101,16 @@ export default function ProviderLimits({
+           emailsVisible={emailsVisible}
+           providerLabels={PROVIDER_LABEL}
+           renderInlineQuotaSummary={(quota) => renderInlineQuotaSummary(quota.quotas)}
++          // Credits constraint slot (wave 5): WorkBuddy cards have no quota gauges, so the
++          // per-connection credit meter is the card body's only meter. The badge fetches
++          // `?all=true&detail=fast&connectionId=<id>` and promotes itself once to a full probe
++          // when the snapshot has no verdict, so the page pays zero billing calls on first paint.
++          renderCreditsSlot={(conn) => {
++            const creditsConnectionId = workBuddyCreditsForDisplay(conn);
++            return creditsConnectionId ? (
++              <WorkBuddyPoolCreditBadge connectionId={creditsConnectionId} />
++            ) : null;
++          }}
+           onRefresh={refreshProvider}
+           onOpenCutoff={(conn) => {
+             const windows = (visibleQuotaData[conn.id]?.quotas || []).filter(

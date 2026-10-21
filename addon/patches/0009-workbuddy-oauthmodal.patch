@@ -1,0 +1,13 @@
+diff --git a/src/shared/components/OAuthModal.tsx b/src/shared/components/OAuthModal.tsx
+index 5deb9d1..a4c7606 100644
+--- a/src/shared/components/OAuthModal.tsx
++++ b/src/shared/components/OAuthModal.tsx
+@@ -54,6 +54,8 @@ const DEVICE_CODE_PROVIDERS = new Set([
+   "ghe-copilot",
+   "grok-cli",
+   "muse-code",
++  // workbuddy: device-flow only (upstream flowType: "device_code", confirmed NO_PKCE_DEVICE_CODE_PROVIDERS route.ts:67-78; the UI divergence the 3.8.52 compiled-splice A1 patch fixed. See addon/SOURCES.md note.)
++  "workbuddy",
+ ]);
+ 
+ const TOKEN_PASTE_PROVIDERS = new Set(["devin-desktop", "devin-cli", "grok-cli", "claude"]);

@@ -80,3 +80,26 @@ export function formatWorkBuddyCreditBadge(
   if (tier === "unknown") return null;
   return `${tier} (${creditMultiplier.toFixed(2)}x)`;
 }
+
+/**
+ * Which connection a Provider Quota card should carry a credits strip for, or `null` (wave 5).
+ *
+ * WorkBuddy is not a quota provider: it is absent from `USAGE_SUPPORTED_PROVIDERS`, so
+ * `supportsProviderQuota()` answers false and the Provider Quota panel used to drop the
+ * connection from the page entirely. Its credit meter is the only budget it has, so the card is
+ * admitted by this predicate instead — and the same call supplies the badge's `connectionId`.
+ *
+ * Returning the id (not a boolean) is deliberate: the gate and the badge argument are then one
+ * decision, so a card can never render with an empty strip or a strip with no card. An id is
+ * trimmed and required: without it the pool endpoint (`?connectionId=`) would probe every
+ * connection the instance has, which is a billing call per account the operator never asked for.
+ */
+export function workBuddyCreditsForDisplay(
+  connection: { provider?: unknown; id?: unknown } | null | undefined
+): string | null {
+  if (!connection) return null;
+  const providerId = typeof connection.provider === "string" ? connection.provider : "";
+  if (!isWorkBuddyProviderId(providerId)) return null;
+  const connectionId = typeof connection.id === "string" ? connection.id.trim() : "";
+  return connectionId.length > 0 ? connectionId : null;
+}

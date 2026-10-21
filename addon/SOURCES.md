@@ -26,7 +26,7 @@ Citation convention: `path:lines` is relative to the overlay target (the upstrea
 | `src/lib/workbuddy/freeModel.ts:1-89` | `src/lib/workbuddy/freeModel.ts` | Verbatim: `selectWorkBuddyFreeModel` (largest window wins; `undefined` is NOT free), `listWorkBuddyFreeModels`, `rankWorkBuddyModelsByCost`, `describeWorkBuddyFreeModel`. |
 | `src/lib/workbuddy/poolQuota.ts:1-732` (trimmed) | `src/lib/workbuddy/poolQuota.ts` | Single edition. Keeps the 10-minute snapshot TTL (`WORKBUDDY_QUOTA_SNAPSHOT_TTL_MS`), per-connection in-flight dedupe (`batchFor`), `Promise.allSettled` per-account isolation, `diagnoseWorkBuddyFailure`, `invalidateWorkBuddyQuotaSnapshot` and `selectWorkBuddyQuotaAccount`. ADDED a `deps` seam (`WorkBuddyPoolProbeDeps`: `listConnections`/`readCredits`) so T6 can drive the engine without a database — production never passes it. Dropped: the multi-edition loop, the shape-walking pool-state reader (replaced by one typed sibling call) and the check-in invalidation call. |
 | `src/lib/workbuddy/poolState.ts:1-453` (reader + gated writer) | `src/lib/workbuddy/poolState.ts` | The document shape is fork-compatible (`version` + `cid → {connectionId, reason, retryDueMs, updatedAt}`), the read uses `O_NOFOLLOW` and is fail-open, the write is atomic (0600 + rename). Trimmed: the failure-kind vocabulary and the merge rule belonged to the executor path this port does not ship. **The writer is off by default**: `workBuddyPoolStateWriterEnabled()` is true only for `WORKBUDDY_POOL_STATE=1` (plan §C3/§R4), so the image never creates files on the data volume unless asked. |
-| `src/shared/utils/workBuddyCredit.ts:27-78` | `src/shared/utils/workBuddyCredit.ts` | Verbatim and client-safe (no DB, no env): `isWorkBuddyProviderId`, `declaredWorkBuddyCreditMultiplier`, `workBuddyPriceTier`, `formatWorkBuddyCreditBadge`. |
+| `src/shared/utils/workBuddyCredit.ts:27-78` | `src/shared/utils/workBuddyCredit.ts` | Verbatim and client-safe (no DB, no env): `isWorkBuddyProviderId`, `declaredWorkBuddyCreditMultiplier`, `workBuddyPriceTier`, `formatWorkBuddyCreditBadge`. **Wave 5** appended `workBuddyCreditsForDisplay(connection)` — the Provider Quota admission gate that returns the connection id to probe (family match + non-empty id) or `null`, so admitting a card and scoping its badge are one decision. |
 | — (new) | `src/shared/utils/workBuddyEfforts.ts` | The override vocabulary = INTERSECTION of the gateway ladder (adds `minimal`) and the override parser (adds `ultra`): `none, low, medium, high, xhigh, max` (plan §6/R7), plus parse/serialize/toggle/format helpers. |
 | `src/app/api/workbuddy/_lib.ts:1-216` | `src/app/api/workbuddy/_lib.ts` | Single edition, `requireManagementAuth` guard, sanitized error bodies, edition/account resolution, credit shaping. Dropped: the `loopbackOnly` claim (these routes are management-authenticated, not loopback-only) and the accounts/import/checkin route table. |
 | `src/app/api/workbuddy/models/route.ts`, `free-model/route.ts` | same paths | Verbatim shape, single-edition copy ("Unknown provider. Use workbuddy."). |
@@ -42,6 +42,7 @@ Citation convention: `path:lines` is relative to the overlay target (the upstrea
 | — | `tests/unit/workbuddy-reasoning.test.ts` | New (plan §9 T5). Twelve cases: the pure ladder rule (strip / clamp up / off→`none` / off→floor / unknown word / `thinking` never forwarded), the override-first contract (B2, incl. the bulk-map path and connection-scoped row precedence), the single-edition id mapping, and B3/B4 wiring (both map keys resolve to `WorkBuddyExecutor`; the wire body is clamped end-to-end; the D9 gate leaves the body untouched). |
 | — (new) | `src/shared/utils/workBuddyCreditProbe.ts` | **Wave 4 (§C4 follow-up).** The badge's promotion rule as a pure predicate: `needsWorkBuddyFullCreditProbe(body)` is true when any edition reports `pending` or any account's `status` is `unknown` (or absent), and false for `ok`/`error`/`excluded`, an edition with no rows, and an empty body. Client-safe (no env, no DB), so the component and T8 share one source of truth instead of an inline condition the test would have to restate. |
 | — | `tests/unit/workbuddy-pool-badge.test.ts` | New (wave 4, T8): the promotion predicate — promotes on `pending: 1`, on any `unknown` row, on a status-less row and on a later edition; does **not** promote on `ok`/`error`/`excluded`, on an edition with no rows, or on an empty/absent body (those would be billing-call loops, not display fixes). |
+| — (new) | `docs/reference/WORKBUDDY_ADDON.md` | **Wave 5 operator brief.** What ships per wave, upstream-vs-patched (device code, B1v2 key, known-free rule, compact trigger, the missing quota card), the known gaps (workbuddy-global, desktop scan, env-doc debt, no aggregate bar), removal via `WORKBUDDY_ADDON=0`, the five-step resume, and the D-1..D-36 index. Copy-delivered (it is documentation, not a hunk) and indexed by `0008`; mirrored at `.handoff/HANDOFF-WORKBUDDY.md` in the fork-ci repo, which no build step consumes. |
 | — | `tests/unit/workbuddy-opencode-premium.test.ts` | New (wave 4, `0005`): the free-lane rule at source level — the `-free` suffix and the legacy free ids stay free under a catalog that omits them, the catalog still decides for ids that make no free claim, an unknown id is premium with no synced catalog, and `opencode-go` stays fully keyed; plus the anonymous-key header contract (gated free request → env key; paid model, `/zen/go` surface and blank env → connection key; no credential and no env → no `Authorization`; zen Responses surface → `x-api-key`). |
 
 Tests live under `addon/files/tests/unit/` on purpose: `overlay.sh` copies them into the
@@ -132,6 +133,105 @@ matches them. No other button changes.
 | `.../components/ModelRow.tsx:484-486` | Passes `compact` to its `ModelCompatPopover`. Managed rows are the right-column cards the clip was reported on; `PassthroughModelRow` already passed it, so the shared trigger fixes both paths at the source instead of duplicating markup per row. | bug 3 of the wave-4 brief |
 | `.../components/PassthroughModelRow.tsx:456` | Comment only (no markup change): the call site states that `compact` is the icon-only form and why, because the row renders the shared trigger and a future refactor of the popover must not reintroduce the label here. The passthrough and compatible sections both flow through this row (`CompatibleModelsSection.tsx:566-607` renders `PassthroughModelRow`), so one shared trigger covers them. | bug 3 of the wave-4 brief |
 | `addon/overlay.sh` (governance) | Four markers added for wave 4 (the two `0005` anchors, the badge's promoted call, the icon-only `aria-label`) — 32 → 36 assertions. | plan §2 |
+
+## Modified files (`addon/patches/0007-workbuddy-quota-budget.patch` — wave 5, quota budget)
+
+Plan §C4 concluded that the connection-row strip was the only credits surface WorkBuddy could
+have, because `workbuddy` is absent from `USAGE_SUPPORTED_PROVIDERS`
+(`open-sse/services/usage/supportedProviders.ts`, re-exported at
+`src/shared/constants/providers.ts:507`) and `supportsProviderQuota()` therefore answers `false`
+for it. That is true of the *quota* capability, and it had a second consequence the plan did not
+draw out: the panel's `filteredConnections` dropped the connection entirely, so Provider Quota
+(and the `/dashboard/quota` page that renders it) showed no WorkBuddy card at all. Wave 5 makes
+the card exist and gives it the only meter the provider has.
+
+The injection is **three hops**, not the one anchor plan §C4 implies, because the card body is
+rendered by `QuotaCard` and `QuotaCardGrid` is the component that owns the per-connection node.
+Adding the badge in `ProviderLimits` alone would compile and render nothing (the grid takes
+primitives, not children), which is why the grid gains an optional render prop rather than a
+second hard-coded branch per provider.
+
+| Upstream anchor | Change | Origin |
+|---|---|---|
+| `src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx:36-41` | Two imports: `workBuddyCreditsForDisplay` (client-safe gate, from the copied credit module) and `WorkBuddyPoolCreditBadge`. | plan §C4 |
+| `.../ProviderLimits/index.tsx:455-463` (`refreshProvider`) | Returns early for a connection the gate admits. It has no provider-usage implementation, so the card's refresh could only paint an error line beside the strip; the strip owns the refresh path (`?refresh=1`), and the guard is the same predicate as the slot. | this port |
+| `.../ProviderLimits/index.tsx:534-549` (`filteredConnections`) | Membership becomes `supportsProviderQuota(conn.provider, conn) \|\| workBuddyCreditsForDisplay(conn) !== null` — "quota-supported, or has a credits line to show". The `authType` and `isProviderQuotaVisible` terms are untouched. | this port |
+| `.../ProviderLimits/index.tsx:1101-1114` | Passes `renderCreditsSlot`: resolves the connection id once and renders `<WorkBuddyPoolCreditBadge connectionId={…} />`, `null` for every other provider. The badge's own first paint is `?all=true&detail=fast` (snapshot only), so the page still costs zero billing calls. | plan §C4 |
+| `.../ProviderLimits/QuotaCardGrid.tsx:23-31` | New optional prop `renderCreditsSlot?: (connection: any) => ReactNode` + doc-comment. Generic over the bundled connection shape: the grid never inspects the row, the caller decides per connection. | this port |
+| `.../QuotaCardGrid.tsx:173-176`, `:229-231`, `:247-249`, `:290-292`, `:330-332` | Threaded through both render paths — the flat `compact` grid and the expandable `ProviderQuotaSection` — so a WorkBuddy card carries its slot in either layout, and computed once per card (`creditsSlot={renderCreditsSlot ? renderCreditsSlot(conn) : undefined}`). | this port |
+| `.../ProviderLimits/QuotaCard.tsx:1-4`, `:66-72`, `:92-95`, `:197-204` | New `creditsSlot?: ReactNode` prop, rendered **after** `<QuotaCardExpanded/>` — i.e. after every gauge/row the provider reported, which is where the "Credits constraint" slot belongs: the quota list is empty for WorkBuddy, so the strip is the card body's only meter. Bordered with the card's own hairline. | plan §C4 ("insert outside the quotaPanelSupported gate") |
+| `addon/files/src/shared/utils/workBuddyCredit.ts` (copied file) | Appended `workBuddyCreditsForDisplay(connection)`: returns the trimmed `connection.id` when `isWorkBuddyProviderId(connection.provider)`, else `null`. Returning the id (not a boolean) keeps the admission gate and the badge's `connectionId` one decision — a card can never render an empty strip, and a strip can never probe with no `connectionId` (which the route would read as "every account"). | plan §C4 |
+| `tests/unit/workbuddy-pool-badge.test.ts` (copied file) | Extended with the wave-5 gate: family ids (`workbuddy`, `wb`) return the id; another provider, a whitespace-only id and a missing row return `null`. The T8 promotion suite is unchanged above it. | plan §9 |
+| `addon/overlay.sh` (governance) | Five markers: three for `0007` (the panel's `renderCreditsSlot` call — the only thing that makes the connection a card — the grid's forward, and the card's slot render), two for `0008`. 38 → 43 assertions. Either hop of the three compiles fine and renders nothing, which is exactly the bug wave 5 fixes. | plan §2 |
+
+## Modified files (`addon/patches/0008-session-handoff-doc.patch` — wave 5, docs index)
+
+The operator brief is **copy-delivered** (`addon/files/docs/reference/WORKBUDDY_ADDON.md`, so it
+lands in the built image's `docs/reference/`). `0008` is therefore one line of navigation, not a
+port: the docs site's `pages` list is an explicit literal, and a page that exists but is not listed
+is invisible to the docs build. The same content is mirrored at
+`.handoff/HANDOFF-WORKBUDDY.md` in the fork-ci repository for file-based discovery (no Docker
+integration — nothing copies `.handoff/` into the image, by design).
+
+| Upstream anchor | Change | Origin |
+|---|---|---|
+| `docs/reference/meta.json:11-14` | `"WORKBUDDY_ADDON"` appended to `pages` (after `RELAY_TROUBLESHOOTING`). The list is explicit and order-stable; appending keeps the existing order byte-identical. | wave-5 brief §2 |
+| `addon/overlay.sh` (governance) | Two markers, both about the delivered artifact rather than a hunk: the docs index lists the page (a nav entry pointing at nothing is a broken docs build, so the marker is a must-fail), and the page still documents the kill switch (`WORKBUDDY_ADDON=0`) that the removal section promises. | plan §2 |
+
+## Modified files (`addon/patches/0009-workbuddy-oauthmodal.patch` — wave 5b, device-code routing)
+
+Wave 5b restores, **in source**, the one-line UI divergence the 3.8.52 prebuilt carried as a
+compiled splice (patch-spec §A1 / `A1`: "add `workbuddy` to the device-code provider set"). The
+source-mode plan had marked A1 obsolete on the assumption that 3.8.53 had absorbed it; it had not.
+`src/app/api/oauth/[provider]/[action]/route.ts:66-77` lists `workbuddy` in
+`NO_PKCE_DEVICE_CODE_PROVIDERS` and `src/lib/oauth/providers/workbuddy.ts` declares
+`flowType: "device_code"` with a `requestDeviceCode` that returns the `device_code` /
+`verification_uri` pair, so the **server** already serves the device flow for `workbuddy`. The
+**modal** did not know it: `DEVICE_CODE_PROVIDERS` omitted the id, so `startOAuthFlow` fell
+through to the PKCE branch and the connect screen asked the user for a browser callback that the
+provider will never perform. The fix is the missing member of an existing set — no protocol, route
+or component change.
+
+| Upstream anchor | Change | Origin |
+|---|---|---|
+| `src/shared/components/OAuthModal.tsx:47-59` (`DEVICE_CODE_PROVIDERS`) | Insert `"workbuddy"` as the last member of the set literal (after `"muse-code"`, the alphabetical-ish position the set keeps), preceded by a comment recording the three facts a future reader would otherwise have to re-derive: the upstream flow is `device_code`, the server-side confirmation lives in `NO_PKCE_DEVICE_CODE_PROVIDERS` (`route.ts:67-78`), and this is the 3.8.52 compiled-splice A1 divergence. `"workbuddy"` is the id `getProvider()` resolves (`WORKBUDDY_PROVIDER_ID`, `src/lib/workbuddy/types.ts`), i.e. the same string the route's set carries. | patch-spec §A1; wave-5b brief §1 |
+| `addon/overlay.sh` (governance) | Two markers (the rationale comment; the entry as the literal's last member, `"workbuddy",\n]);`) — 36 → 38 assertions. Two, not one, because the guarded failure is positional: an entry that exists outside `DEVICE_CODE_PROVIDERS` still type-checks and renders the PKCE step. | plan §2 |
+
+**Deliberately not touched (D1 / DEFERRED).** `TOKEN_PASTE_PROVIDERS`,
+`IMPORT_TOKEN_ONLY_PROVIDERS`, `PASTE_FIRST_PROVIDERS`, `PKCE_CALLBACK_SERVER_PROVIDERS` and
+`PKCE_CALLBACK_PROVIDERS` are byte-identical to upstream after this patch. The paste tab is a
+fork-only affordance (D1): the addon's `workbuddy` credential comes from the device flow, and
+adding `workbuddy` to a paste set would advertise a form the server does not accept for this
+provider (`IMPORT_TOKEN_PROVIDERS` in the route does not list it either). If paste is ever ported
+it lands as its own patch, not as an unverified member of this one.
+
+**Why no unit test.** The 3.8.52 fix shipped without one, and the harness has nothing to assert
+here: `DEVICE_CODE_PROVIDERS` is a module-private `new Set([...])` inside a `"use client"` `.tsx`
+file, and the repo's `node --test` + `tsx` suite does not render components, so the only
+observable is the rendered step — a DOM test this addon does not have. The server half is already
+pinned by the upstream `tests/unit/workbuddy-provider.test.ts` (its `flowType: "device_code"`
+assertion) and the route's own set. The regression is therefore pinned by **overlay post-conditions
+plus the two manual checks below**, which is what the compiled splice relied on as well.
+
+**Manual verification for wave 5b** (run against an overlaid tree; both are the checks named in
+the brief):
+
+1. *Static — the set contains the entry, in the set.* In the overlaid tree:
+   `grep -n '"workbuddy"' src/shared/components/OAuthModal.tsx` must report exactly two lines:
+   `:57` (the comment) and `:58` (`  "workbuddy",`), with `:59` the literal's closing `]);`.
+   The overlay already fails closed on this (the two 0009 markers), so this check is the human
+   confirmation, not the only guard. `git diff` on the file must show **one hunk, two added
+   lines**, and nothing at `TOKEN_PASTE_PROVIDERS` / `IMPORT_TOKEN_ONLY_PROVIDERS`.
+2. *Runtime — the connect preflight answers with a device code.* POST
+   `/api/oauth/workbuddy/device-code` (the source-mode equivalent of the prebuilt artifact's
+   `/api/workbuddy/authorize` shim — see deviation 31) must answer `200` with
+   `{ device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval }`
+   (`route.ts:284-289` spreads `requestDeviceCode` and adds `codeVerifier`;
+   `src/lib/oauth/providers/workbuddy.ts:102-110` maps the gateway's
+   `{ code: 0, data: { state, authUrl } }` onto `device_code = state` and
+   `verification_uri[_complete] = authUrl`). A `400 "Provider does not support device code flow"`
+   would mean the registry lost `flowType: "device_code"`; a UI that jumps to the PKCE step
+   despite that `200` is exactly the bug `0009` fixes.
 
 ### Deliberate deviations from the plan text (reported, not silent)
 
@@ -306,6 +406,62 @@ matches them. No other button changes.
     neighbouring eye/copy/test buttons, so the remedy does not trade a layout bug for an
     accessibility one.
 
+**Wave 5b:**
+
+30. **The A1 splice is restored as a source patch; the plan's "obsolete" verdict was wrong.**
+    `PLAN.patch-spec.md` retired A1 on the belief that 3.8.53 had folded `workbuddy` into the
+    modal's device-code set. It had not: the server sets (`NO_PKCE_DEVICE_CODE_PROVIDERS`,
+    `PKCE_CALLBACK_PROVIDERS`) and the provider registry did absorb the id, the *modal's*
+    `DEVICE_CODE_PROVIDERS` did not, so the prebuilt behaviour (device panel) and the source build
+    (PKCE step → dead callback) genuinely diverged. The plan line is superseded by this patch; the
+    runtime fact that made A1 necessary never changed.
+31. **The brief's `/api/workbuddy/authorize` probe has no source-mode counterpart; the check
+    moves to the upstream OAuth router.** The prebuilt 3.8.52 artifact reached the flow through an
+    addon shim route that returned the gateway body almost verbatim (`{ code, data: { device_code,
+    authUrl } }`). In source mode no such route exists — the fork's `addon/files/src/app/api/workbuddy/`
+    ships only the read-only `models` / `credits` / `free-model` / `info` surface — and the flow is
+    served by upstream's generic router at `POST|GET /api/oauth/workbuddy/device-code`
+    (`src/app/api/oauth/[provider]/[action]/route.ts:210-289`), which normalises the same gateway
+    answer into `device_code` / `verification_uri[_complete]` and adds `codeVerifier`. The
+    verification is therefore recorded against that endpoint (with the exact body shape) instead
+    of re-introducing a second, unowned authorize route just to satisfy the brief's path.
+32. **No unit test; two post-condition markers instead.** Documented in the 0009 section: the set
+    is module-private inside a client `.tsx` and the harness renders no components, so a test would
+    either need a DOM harness this addon does not have or would assert source text (which the
+    overlay markers already do, fail-closed, on every build). The existing
+    `tests/unit/workbuddy-provider.test.ts` keeps the server-side `flowType: "device_code"` pinned.
+33. **The file number is `0009`, not `0007`.** The wave-5b brief allocates the `0009` slot, and
+    when this patch was written the two intervening numbers belonged to waves still in flight in
+    sibling branches (workbuddy quota, session/handoff doc). Both have since landed —
+    `0007-workbuddy-quota-budget.patch` and `0008-session-handoff-doc.patch` — so the series is
+    now **contiguous `0001`–`0009`** and 0009 is last. The ordering was never a dependency:
+    `0009` touches exactly one file (`OAuthModal.tsx`) that no other patch in the series touches,
+    which is verified both ways (see the coexistence row in the wave-5b verification table), so
+    the patch applies identically whether it lands before or after them. Renumbering it to `0007`
+    would have collided with a patch that was about to appear in that exact slot.
+
+**Wave 5:**
+
+34. **The Provider Quota injection is three upstream hunks, not the plan's one anchor.** §C4 names
+    `ConnectionRow.tsx` (already shipped in `0003`) and implies the quota card is reachable from
+    `ProviderLimits` alone. It is not: `ProviderLimits` passes primitives to `QuotaCardGrid`, the
+    grid owns the per-connection `QuotaCard` node, and the card body is `QuotaCard`'s own JSX. A
+    badge added only in the panel would compile and render nothing. The grid therefore gains an
+    optional render prop (`renderCreditsSlot`) instead of a provider-specific branch, which keeps
+    the grid provider-agnostic and the decision (`workBuddyCreditsForDisplay`) in one place.
+35. **`dashboard/quota/page.tsx` receives no hunk.** The brief describes a "QuotaCards workbuddy
+    connection duplicated card injection ... in the expansion `[id='workbuddy']` gate". Read fresh:
+    the page is a 34-line shell (settings fetch + `<ProviderLimits autoRefreshInterval=…/>`); it
+    contains no card markup, no per-connection map and no `[id='workbuddy']` expansion — the
+    `/dashboard/providers/[id]` route has no `QuotaCardGrid` either. The card the brief describes
+    is the one `ProviderLimits` renders, so the wiring landed there and in the two components it
+    delegates to. Inventing a second injection point in the shell would have been dead code.
+36. **`workBuddyCreditsForDisplay` returns the connection id, not a boolean.** A boolean gate plus
+    a separate `connection.id` in the JSX is two decisions that can disagree (and the badge's
+    `connectionId` is what scopes the pool probe — an empty one makes the route read the whole
+    pool). Returning the id keeps admission and probing atomic and gives the unit test something
+    falsifiable to assert. The name follows the wave-5 brief's own `workBuddyCreditsForDisplay`.
+
 ## DEFERRED (plan §12 — explicitly out of this port)
 
 * **CN edition + `workbuddy-global` provider id.** Needs a *new* id, not a rename: `workbuddy`
@@ -422,3 +578,36 @@ one.
 The 116- and 982-test runs borrowed the fork checkout's `node_modules` via a symlink and pointed
 `TMPDIR` at `/workspace/.tmp_wave4`, exactly as waves 1–3 did. No commit was made in this
 repository for wave 4.
+
+## Verification performed for wave 5b (not a promise — the transcript is in the hand-off)
+
+Fresh oracle trees, all built the same way — `rsync -a --exclude=.git --exclude=node_modules` of
+the upstream checkout @ `e9cb075c`, then `git init` + one commit: `/workspace/pkgtest_scratch15`
+(`01b689d`, the 7-patch series as it stood when this patch was written), `…15b` (`f465ed8`, second
+tree against the then-current `addon/files/`) and `…15c` (`c428a46`, the **final** run: the
+contiguous `0001`–`0009` series after the sibling waves landed `0007`/`0008`). Every number below
+was produced against a tree built from its own commit, not against an incrementally patched one.
+
+| Check | Command | Result |
+|---|---|---|
+| **Final: the whole series, `0001`–`0009`** | `bash addon/overlay.sh /workspace/pkgtest_scratch15c` | `overlay: copied 30 file(s)`, `overlay: preflight passed for 9 patch(es)`, `overlay: applied 0001…0009`, **43 post-condition assertions passed** (36 from waves 1–4 + 5 from wave 5's `0007`/`0008` + 2 from `0009`), `overlay ok — 9 patch(es), 30 file(s)`, exit **0** |
+| **Wave 5 oracle (`pkgtest_scratch14`)** | fresh `rsync _up/OmniRoute` + `git init` + `bash addon/overlay.sh .` | `overlay: copied 30 file(s)`, `preflight passed for 9 patch(es)`, `applied 0001…0009`, **43 post-condition assertions passed**, `overlay ok — 9 patch(es), 30 file(s)`, exit **0**; immediate rerun exits **1** (`work tree has changes relative to HEAD … nothing was applied`); `tests/unit/workbuddy-*.test.ts` **111/111**, the two opencode contract files **28/28**; `tsc -p tsconfig.typecheck-core.json` exit 0; open-sse typecheck `0` errors; dashboard typecheck `196 pre-existing, all within frozen baseline` (0 live); prettier + eslint (with the repo suppressions) clean on the five touched files. Note: `tests/unit/docs/vision-key-scope-locales.test.ts` fails on **pristine upstream** too (`docs/security/GUARDRAILS.md` hash ≠ `.i18n-state.json`), so it is not a signal from this series — verified by hashing the untouched upstream tree |
+| Series applies with 0009 (as of this patch) | `bash addon/overlay.sh /workspace/pkgtest_scratch15` | `overlay: copied 29 file(s)`, `overlay: preflight passed for 7 patch(es)`, `overlay: applied 0001…0006, 0009`, **38 post-condition assertions passed** (36 + the 2 new 0009 markers), `overlay ok — 7 patch(es), 29 file(s)`, exit **0** |
+| Fail-closed | same command a second time | `overlay: ERROR — work tree has changes relative to HEAD in /workspace/pkgtest_scratch15 … nothing was applied`, exit **1**; the clean-tree precondition is unchanged by 0009 |
+| Marker is positional, not textual | `grep -n '"workbuddy"' src/shared/components/OAuthModal.tsx` on the overlaid tree | `:57` comment, `:58` `  "workbuddy",`, `:59` `]);` — the entry is the literal's last member; `git diff` for the file is **one hunk, 2 added lines, 0 removed**, and no line at `TOKEN_PASTE_PROVIDERS` / `IMPORT_TOKEN_ONLY_PROVIDERS` |
+| Wave-4 suites unchanged (no regression) | `node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts --test tests/unit/workbuddy-opencode-premium.test.ts tests/unit/executor-map-golden.test.ts tests/unit/workbuddy-provider.test.ts` | **43/43 pass**, exit **0** on `/workspace/pkgtest_scratch15` **and again 43/43 on `…15c`** (the 9-patch tree, `duration_ms` 9.1 s / 12.7 s) — the opencode premium lane (13), the executor-map golden (chat/executor wiring intact) and the provider suite, including its `flowType: "device_code"` pin |
+| Core typecheck gate | `./node_modules/.bin/tsc --pretty false -p tsconfig.typecheck-core.json` (`npm run typecheck:core` aborted on `ENOSPC` writing its npm log to a full `/tmp`) | exit **0**, no diagnostics — on both the 7-patch tree and `…15c` |
+| Format | `prettier --check src/shared/components/OAuthModal.tsx` | `All matched files use Prettier code style!`, exit 0 (a 197-char comment is not rewrapped by Prettier) |
+| Lint | `eslint src/shared/components/OAuthModal.tsx` | 3 errors, all **pre-existing and lint-neutral**: the same three (`no-unused-vars` at `:812`, `:823`, `:858`) are reported for the pristine file at `:810`, `:821`, `:856` — the identical statements shifted by the 2 inserted lines, verified by linting `git show HEAD:…` in place |
+| Env/doc contract | not re-run | 0009 adds no `process.env` reference and no env-backed knob, so `check-env-doc-sync` cannot move; wave 4's two pre-existing addon debts (`WORKBUDDY_ADDON`, `WORKBUDDY_POOL_STATE`) are untouched |
+| Same, on a second tree built from the current `addon/files/` | `/workspace/pkgtest_scratch15b` @ `f465ed8` (upstream + one commit) → `bash addon/overlay.sh /workspace/pkgtest_scratch15b` | identical: `preflight passed for 7 patch(es)`, **38 assertions**, `overlay ok — 7 patch(es), 29 file(s)`, exit **0**. Run because a sibling wave wrote `addon/files/src/shared/utils/workBuddyCredit.ts` (+23 lines, `workBuddyCreditsForDisplay`) at 05:09, i.e. **after** the first tree was tested: the series does not depend on that file, and the second run proves the copied-file half still yields a green overlay |
+| Coexistence with `0007`/`0008` | minimal tree holding the files the three patches touch (`git show HEAD:…` from the oracle, `git init`, one commit) → `git apply 0007`, `git apply 0008`, then `git apply --check 0009` and `git apply 0009` | `0007 applied`, `0008 applied`, `0009 applied`; `grep -n '"workbuddy"'` then reports `:58` in the same mini-tree. The patches are **file-disjoint** (`QuotaCard.tsx` / `QuotaCardGrid.tsx` / `ProviderLimits/index.tsx`, `docs/reference/meta.json`, `OAuthModal.tsx`), so the series is contiguous `0001`–`0009` and 0009 order-independent |
+
+The 43-test run borrowed `/workspace/pkgtest_scratch12/node_modules` via a symlink (the only
+installed tree on this host) and pointed `TMPDIR` at `/workspace/.tmp_wave5b`. Two environment
+notes for whoever replays this: `/tmp` was **full** (2.0 GB tmpfs) during wave 5b, which is why
+`npm run` (its log dir lives under `/tmp/.npm-cache`) failed with `ENOSPC` while the direct `tsc`
+binary did not — set `TMPDIR` before `npm`, or call the binary; and the first overlay attempt in
+this wave failed **inside `overlay.sh` itself** because a marker comment contained an apostrophe
+inside the single-quoted `node -e` script — the shipped block avoids apostrophes and says so. No
+commit was made in this repository for wave 5b.

@@ -1,0 +1,13 @@
+diff --git a/docs/reference/meta.json b/docs/reference/meta.json
+index 2a96cef1..c6052ae8 100644
+--- a/docs/reference/meta.json
++++ b/docs/reference/meta.json
+@@ -11,6 +11,7 @@
+     "REMOVED_PROVIDERS",
+     "PROVIDER_PLUGIN_MANIFEST",
+     "RELAY_BACKEND_STRATEGY",
+-    "RELAY_TROUBLESHOOTING"
++    "RELAY_TROUBLESHOOTING",
++    "WORKBUDDY_ADDON"
+   ]
+ }

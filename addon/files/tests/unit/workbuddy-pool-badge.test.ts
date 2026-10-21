@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { needsWorkBuddyFullCreditProbe } from "@/shared/utils/workBuddyCreditProbe";
+import { workBuddyCreditsForDisplay } from "@/shared/utils/workBuddyCredit";
 
 describe("needsWorkBuddyFullCreditProbe — when a fast body earns one full probe", () => {
   it("promotes when the edition reports pending accounts (`pending: 1`)", () => {
@@ -81,5 +82,25 @@ describe("needsWorkBuddyFullCreditProbe — when a fast body earns one full prob
     assert.equal(needsWorkBuddyFullCreditProbe({}), false);
     assert.equal(needsWorkBuddyFullCreditProbe(null), false);
     assert.equal(needsWorkBuddyFullCreditProbe(undefined), false);
+  });
+});
+
+/**
+ * Wave 5 — the Provider Quota admission gate. `workbuddy` is absent from
+ * `USAGE_SUPPORTED_PROVIDERS`, so the panel has to decide per connection whether the row is a
+ * quota card at all; the same call supplies the pool badge's `connectionId`. Returning the id
+ * (rather than a boolean) is what keeps those two from disagreeing, so the cases below are the
+ * whole contract: family in, everything else out, and no empty probe.
+ */
+describe("workBuddyCreditsForDisplay — which connections get a credits slot", () => {
+  it("admits the family and returns the id the badge probes", () => {
+    assert.equal(workBuddyCreditsForDisplay({ provider: "workbuddy", id: "conn_1" }), "conn_1");
+    assert.equal(workBuddyCreditsForDisplay({ provider: "wb", id: "conn_2" }), "conn_2");
+  });
+
+  it("refuses another provider, an empty id, and a missing row", () => {
+    assert.equal(workBuddyCreditsForDisplay({ provider: "codex", id: "conn_1" }), null);
+    assert.equal(workBuddyCreditsForDisplay({ provider: "workbuddy", id: "   " }), null);
+    assert.equal(workBuddyCreditsForDisplay(null), null);
   });
 });

@@ -187,6 +187,42 @@ const markers = [
     "src/app/(dashboard)/dashboard/providers/[id]/components/ModelCompatPopover.tsx",
     "aria-label={t(\"compatButtonLabel\")}",
   ],
+  // 0009 — workbuddy is routed through the device-code panel. Two markers, because the failure
+  // mode this guards is positional: the set is a list of literals consumed by `has(provider)`, so
+  // an entry that exists but sits under a different flow (or outside the literal) still
+  // type-checks and renders the wrong step. The first pins the rationale comment; the second pins
+  // the entry as the last member of the literal (inside DEVICE_CODE_PROVIDERS, not a neighbour).
+  // NOTE: this block is a single-quoted `node -e` script — no apostrophes in these comments.
+  [
+    "src/shared/components/OAuthModal.tsx",
+    "// workbuddy: device-flow only (upstream flowType: \"device_code\"",
+  ],
+  ["src/shared/components/OAuthModal.tsx", "  \"workbuddy\",\n]);"],
+  // 0007 — wave 5 (quota budget). The Provider Quota card had no WorkBuddy surface at all: the
+  // provider is absent from USAGE_SUPPORTED_PROVIDERS, so the filter dropped the connection and
+  // there was no card to put a badge on. Three markers, one per hop of the only path that can
+  // carry a per-connection node: the panel admits the connection and builds the slot, the grid
+  // forwards it to every QuotaCard (both render paths), the card renders it under the quota body.
+  // Either hop missing compiles fine and renders nothing, which is exactly the wave-5 bug.
+  [
+    "src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.tsx",
+    "renderCreditsSlot={(conn) => {",
+  ],
+  [
+    "src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCardGrid.tsx",
+    "creditsSlot={renderCreditsSlot ? renderCreditsSlot(conn) : undefined}",
+  ],
+  [
+    "src/app/(dashboard)/dashboard/usage/components/ProviderLimits/QuotaCard.tsx",
+    "{creditsSlot ? (",
+  ],
+  // 0008 — the operator brief. It is COPY-DELIVERED (addon/files/docs/reference/), so these two
+  // markers assert the delivered artifact rather than a hunk: the docs index lists the page (a
+  // nav entry pointing at nothing is a broken docs build) and the page still documents the
+  // kill switch the removal section promises. The doc is the addon judgement call most likely to
+  // be lost, so its presence is a build fact, not a nicety.
+  ["docs/reference/meta.json", "\"WORKBUDDY_ADDON\""],
+  ["docs/reference/WORKBUDDY_ADDON.md", "WORKBUDDY_ADDON=0"],
 ];
 
 let missing = 0;
